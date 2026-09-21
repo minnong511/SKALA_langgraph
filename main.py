@@ -11,17 +11,27 @@ from uuid import uuid4
 from src.common.artifacts import ArtifactStore, redact
 from src.common.events import EventLogger
 from src.common.runtime import AgentRuntime, CallBudget
+from src.common.terminal import TerminalDashboard
 from src.config import Settings, create_llm
 from src.exporters.pdf import export_pdf
 from src.graph import build_graph, get_results, initial_state
 from src.schemas import AgentContext, AgentRequest
 
 
-def run_workflow(settings: Settings, request: AgentRequest, *, demo=False, agents=None, context=None):
+def run_workflow(
+    settings: Settings, request: AgentRequest, *, demo=False, agents=None, context=None, plain=False
+):
+    with TerminalDashboard(enabled=not settings.quiet and not plain) as display:
+        return _run_workflow(settings, request, demo=demo, agents=agents, context=context, display=display)
+
+
+def _run_workflow(settings, request, *, demo=False, agents=None, context=None, display=None):
     if not demo and context is None:
         settings.validate_live()
     store = ArtifactStore(settings.output_dir, request.run_id, secrets=settings.secrets)
-    events = EventLogger(store.run_dir, request.run_id, secrets=settings.secrets, quiet=settings.quiet)
+    events = EventLogger(
+        store.run_dir, request.run_id, secrets=settings.secrets, quiet=settings.quiet, display=display
+    )
     started = monotonic()
     events.emit("run_start", "예시 실행 시작" if demo else "실행 시작")
     state = initial_state(request, settings.public_config())
@@ -51,7 +61,13 @@ def run_workflow(settings: Settings, request: AgentRequest, *, demo=False, agent
         context.market_rag = settings.market_rag
         context.stakeholder_rag = settings.stakeholder_rag
         context.pdf_font_path = settings.pdf_font_path
-        context.budget = CallBudget(request.limits.max_total_calls, request.limits.max_run_seconds)
+        context.budget = CallBudget(
+            request.limits.max_total_calls,
+            request.limits.max_run_seconds,
+            reserved_calls=request.limits.reserved_final_calls,
+        )
+        if display is not None:
+            display.budget = context.budget
         runtime = AgentRuntime(context, store, heartbeat_seconds=settings.heartbeat_seconds)
         if demo and agents is None:
             from src.demo import demo_agents
@@ -150,6 +166,7 @@ def cli(argv=None):
     parser.add_argument("--domain", default="클라우드 기반 LLM 서빙")
     parser.add_argument("--as-of-date", type=date.fromisoformat, default=date.today())
     parser.add_argument("--quiet", action="store_true", default=None)
+    parser.add_argument("--plain", action="store_true", help="박스 화면 대신 일반 줄 로그 출력")
     args = parser.parse_args(argv)
     try:
         settings = Settings.from_env(args.env_file, output_dir=args.output_dir, quiet=args.quiet)
@@ -162,7 +179,7 @@ def cli(argv=None):
             as_of_date=args.as_of_date,
             limits=settings.limits,
         )
-        state = run_workflow(settings, request, demo=args.demo)
+        state = run_workflow(settings, request, demo=args.demo, plain=args.plain)
     except Exception as exc:
         print(f"실행 준비 실패: {redact(str(exc), settings.secrets if 'settings' in locals() else [])}")
         return 1

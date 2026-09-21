@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 
 from src.agents import market, report, synthesis, technical, verification
-from src.agents.base import quote_is_present
+from src.agents.base import ResearchOutput, quote_is_present, sanitize_research, source_excerpts
 from src.schemas import (
     REPORT_HEADINGS,
     AgentContext,
@@ -178,6 +178,46 @@ def test_quote_check_allows_line_wrap_but_never_paraphrase():
     assert not quote_is_present(" ", "reduced memory")
 
 
+def test_excerpt_selection_uses_exact_original_and_rejects_foreign_excerpt():
+    original = source()
+    excerpt = source_excerpts(original)[0]
+    proposed = card(evidence_text="Summary ... merged quote", source_excerpt_id=excerpt["excerpt_id"])
+    output = ResearchOutput.model_validate(research_output(cards=[proposed]))
+    cards, findings, gaps = sanitize_research(output, {"s1": original}, "technical", set())
+    assert cards[0].evidence_text == original.content
+    assert findings and not gaps
+    assert proposed.evidence_text == "Summary ... merged quote"
+    foreign = source_excerpts(original.model_copy(update={"source_id": "s2"}))[0]
+    output.evidence_cards[0].source_excerpt_id = foreign["excerpt_id"]
+    cards, findings, gaps = sanitize_research(output, {"s1": original}, "technical", set())
+    assert not cards and not findings
+    assert any("발췌 ID" in gap for gap in gaps)
+
+
+def test_pdf_page_duplicates_are_read_once_and_quotes_audited():
+    first = source().model_copy(
+        update={
+            "file_path": "paper.pdf",
+            "metadata": {
+                "file_sha256": "fingerprint",
+                "page": 1,
+            },
+        }
+    )
+    second = first.model_copy(update={"source_id": "s2"})
+    llm = FakeLLM(SearchQueryPlan=[{"queries": ["one", "two"]}], ResearchOutput=[research_output()])
+    reader = Reader()
+    result = technical.run(
+        request(), AgentContext(llm=llm, retriever=Search([first, second]), source_reader=reader)
+    )
+    assert reader.calls == ["s1"]
+    assert len(result.sources) == 1
+    payload = llm.calls[-1][1]
+    assert "content" not in payload["sources"][0]
+    assert payload["sources"][0]["excerpts"][0]["text"] == first.content
+    assert result.data["citation_audit"][0]["cards"][0]["category"] == "exact_quote"
+
+
 def test_research_uses_actual_sources_and_feeds_context_into_both_prompts():
     llm = FakeLLM(
         SearchQueryPlan=[{"queries": ["query"]}],
@@ -216,7 +256,7 @@ def test_research_rejects_invented_source_and_drops_dependent_finding():
     assert any("없는 출처" in gap for gap in result.gaps)
 
 
-def test_research_rejects_invented_quote_and_retries_only_within_limit():
+def test_research_repairs_invented_quote_without_another_search():
     llm = FakeLLM(
         SearchQueryPlan=[{"queries": ["first"]}, {"queries": ["second"]}],
         ResearchOutput=[research_output(cards=[card(evidence_text="Fabricated quote")]), research_output()],
@@ -225,8 +265,9 @@ def test_research_rejects_invented_quote_and_retries_only_within_limit():
     search = Search([source()])
     result = technical.run(req, AgentContext(llm=llm, retriever=search, source_reader=Reader()))
     assert result.status == "completed"
-    assert len(search.calls) == 2
-    assert llm.calls[2][1]["missing_evidence_feedback"]
+    assert len(search.calls) == 1
+    assert llm.calls[2][1]["citation_errors"]
+    assert result.data["citation_audit"][-1]["repair_only"]
 
 
 def test_research_search_empty_retries_bounded_and_returns_failure():
@@ -235,7 +276,7 @@ def test_research_search_empty_retries_bounded_and_returns_failure():
     req = request().model_copy(update={"limits": ExecutionLimits(max_search_retries=2)})
     result = technical.run(req, AgentContext(llm=llm, retriever=search, source_reader=Reader()))
     assert result.status == "failed"
-    assert len(search.calls) == 3
+    assert len(search.calls) == 2  # No new sources: stop instead of repeating a third search.
 
 
 def test_verification_reopens_original_and_overrides_fabricated_quote_approval():

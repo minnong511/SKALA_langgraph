@@ -25,7 +25,11 @@ class Settings(BaseModel):
     max_research_retries: int = Field(default=2, ge=0, le=10)
     max_report_revisions: int = Field(default=2, ge=0, le=10)
     max_synthesis_retries: int = Field(default=2, ge=0, le=10)
-    max_total_calls: int = Field(default=200, ge=1)
+    max_total_calls: int = Field(default=400, ge=1)
+    reserved_final_calls: int = Field(default=100, ge=0)
+    research_query_limit: int = Field(default=3, ge=1, le=6)
+    research_read_limit: int = Field(default=3, ge=1, le=20)
+    research_source_limit: int = Field(default=12, ge=1)
     max_run_seconds: float = Field(default=1800, gt=0)
     search_timeout_seconds: float = Field(default=30, gt=0, le=300)
     llm_timeout_seconds: float = Field(default=120, gt=0, le=600)
@@ -85,4 +89,6 @@ def create_llm(settings: Settings):
         api_key=settings.llm_api_key.get_secret_value(),
         timeout=settings.llm_timeout_seconds,
         max_retries=0,
+        # Luna rejects reasoning + function tools on Chat Completions.
+        use_responses_api=True if settings.llm_model.startswith("gpt-5.6-luna") else None,
     )

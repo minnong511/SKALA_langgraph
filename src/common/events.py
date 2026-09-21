@@ -18,6 +18,9 @@ def _terminal_details(event: str, details: dict[str, Any]) -> str:
     """Display operational facts without echoing arbitrary source/model payloads."""
     fields = []
     names = (
+        "call_id",
+        "kind",
+        "operation",
         "elapsed_seconds",
         "duration_ms",
         "status",
@@ -49,13 +52,20 @@ class EventLogger:
     """Append one complete JSON object per line and print the same redacted event."""
 
     def __init__(
-        self, run_dir: Path, run_id: str, *, secrets: list[str] | tuple[str, ...] = (), quiet: bool = False
+        self,
+        run_dir: Path,
+        run_id: str,
+        *,
+        secrets: list[str] | tuple[str, ...] = (),
+        quiet: bool = False,
+        display=None,
     ):
         self.run_dir = Path(run_dir)
         self.run_dir.mkdir(parents=True, exist_ok=True)
         self.run_id = run_id
         self.secrets = tuple(secrets)
         self.quiet = quiet
+        self.display = display
         self.path = self.run_dir / "events.jsonl"
 
     def emit(
@@ -90,7 +100,9 @@ class EventLogger:
             with os.fdopen(descriptor, "ab") as handle:
                 handle.write(encoded)
                 handle.flush()
-            if not self.quiet:
+            if not self.quiet and self.display is not None and self.display.enabled:
+                self.display.update(entry)
+            elif not self.quiet:
                 label = f"{entry['agent']}:{entry['task_id']}" if task_id else entry["agent"]
                 rendered = f"{entry['timestamp']} [{label}] {entry['event']} (attempt={entry['attempt']}) {entry['message']}"
                 rendered = rendered.replace("\r", "\\r").replace("\n", "\\n")

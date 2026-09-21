@@ -6,6 +6,7 @@ or call another agent. Source text is untrusted data, not executable instruction
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import unicodedata
@@ -24,6 +25,7 @@ from ..schemas import (
     FollowUpRequest,
     SourceDocument,
 )
+from ..tools.retriever import split_text
 from ..tools.web_search import canonical_url
 
 PROMPT_DIR = Path(__file__).resolve().parents[2] / "prompts"
@@ -75,6 +77,60 @@ def source_material_count(sources) -> int:
 def quote_is_present(quote: str, content: str) -> bool:
     normalized_quote = normalized_text(quote)
     return bool(normalized_quote and normalized_quote in normalized_text(content))
+
+
+def source_excerpts(source: SourceDocument) -> list[dict[str, str]]:
+    """Offer immutable raw-text spans; the model selects rather than rewrites quotes."""
+    return [
+        {
+            "excerpt_id": "X-"
+            + hashlib.sha256(f"{source.source_id}:{start}:{end}:{text}".encode()).hexdigest()[:16],
+            "text": text,
+        }
+        for start, end, text in split_text(source.content, 700, 100)
+    ]
+
+
+def research_sources(sources: dict[str, SourceDocument]) -> list[dict]:
+    return [
+        dict(source.model_dump(mode="json", exclude={"content"}), excerpts=source_excerpts(source))
+        for source in sources.values()
+    ]
+
+
+def citation_diagnostics(output: ResearchOutput, sources: dict[str, SourceDocument]) -> list[dict]:
+    records = []
+    for card in output.evidence_cards:
+        source = sources.get(card.source_id)
+        quote = card.evidence_text
+        own_match = bool(source and quote_is_present(quote, source.content))
+        if source is None:
+            category = "unknown_source"
+        elif card.source_excerpt_id:
+            category = (
+                "excerpt_selected"
+                if any(row["excerpt_id"] == card.source_excerpt_id for row in source_excerpts(source))
+                else "unknown_excerpt"
+            )
+        elif own_match:
+            category = "exact_quote"
+        elif any(quote_is_present(quote, item.content) for item in sources.values()):
+            category = "wrong_source"
+        elif "..." in quote or "…" in quote:
+            category = "noncontiguous_or_ellipsis"
+        else:
+            category = "unmatched_requires_review"
+        records.append(
+            {
+                "evidence_id": card.evidence_id,
+                "source_id": card.source_id,
+                "source_excerpt_id": card.source_excerpt_id,
+                "category": category,
+                "proposed_quote": quote,
+                "direct_quote_match": own_match,
+            }
+        )
+    return records
 
 
 class SearchQueryPlan(BaseModel):
@@ -210,6 +266,16 @@ def sanitize_research(
     for original in output.evidence_cards:
         card = original.model_copy(deep=True)
         source = sources.get(card.source_id)
+        excerpt_error = False
+        if source is not None and card.source_excerpt_id:
+            excerpt = next(
+                (item for item in source_excerpts(source) if item["excerpt_id"] == card.source_excerpt_id),
+                None,
+            )
+            if excerpt is None:
+                excerpt_error = True
+            else:
+                card.evidence_text = excerpt["text"]
         reason = ""
         if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.:-]*", card.evidence_id):
             reason = "인용에 사용할 수 없는 근거 ID"
@@ -217,6 +283,8 @@ def sanitize_research(
             reason = "중복된 근거 ID"
         elif source is None:
             reason = "실제 검색 결과에 없는 출처"
+        elif excerpt_error:
+            reason = "해당 출처에 없는 원문 발췌 ID"
         elif not quote_is_present(card.evidence_text, source.content):
             reason = "출처 원문에서 확인되지 않은 인용문"
         elif not card.claim.strip():
@@ -267,6 +335,34 @@ def sanitize_research(
     return accepted_cards, findings, gaps
 
 
+def repair_source_links(
+    output: ResearchOutput, sources: dict[str, SourceDocument]
+) -> tuple[ResearchOutput, list]:
+    """Repair only unambiguous exact excerpt links, never fuzzy-match claims or quotes."""
+    fixed = output.model_copy(deep=True)
+    catalog = {item["excerpt_id"]: source for source in sources.values() for item in source_excerpts(source)}
+    repairs = []
+    for card in fixed.evidence_cards:
+        source = catalog.get(card.source_excerpt_id)
+        if source is None:
+            continue
+        if (card.source_id, card.source_url, card.source_file) != (
+            source.source_id,
+            source.url,
+            source.file_path,
+        ):
+            repairs.append(
+                {
+                    "evidence_id": card.evidence_id,
+                    "old_source_id": card.source_id,
+                    "source_id": source.source_id,
+                    "method": "exact_excerpt_id",
+                }
+            )
+        card.source_id, card.source_url, card.source_file = source.source_id, source.url, source.file_path
+    return fixed, repairs
+
+
 def run_research(
     request: AgentRequest,
     context: AgentContext,
@@ -286,6 +382,10 @@ def run_research(
     if not tools:
         return failure(request, agent, f"{agent}: 설정된 검색 도구가 없습니다.")
     sources: dict[str, SourceDocument] = {}
+    read_pages: set[tuple] = set()
+    citation_audit: list[dict] = []
+    repair_used = False
+    stop_reason = ""
     errors: list[str] = []
     history: list[dict[str, Any]] = []
     retry_feedback: list[str] = []
@@ -300,6 +400,10 @@ def run_research(
         for card in value.evidence_cards
     }
     for search_round in range(request.limits.max_search_retries + 1):
+        before_round = len(sources)
+        if context.budget is not None and context.budget.research_exhausted:
+            stop_reason = "후속 단계 호출 예산 보존"
+            break
         context.emit(
             request,
             "research_search",
@@ -326,8 +430,12 @@ def run_research(
             request, "search_queries", "검색 질문 준비", queries=queries, search_round=search_round + 1
         )
         round_errors: list[str] = []
-        for query in queries[:6]:
+        for query in queries[: request.limits.research_query_limit]:
             for tool in tools:
+                if len(sources) >= request.limits.research_source_limit or (
+                    context.budget is not None and context.budget.research_exhausted
+                ):
+                    break
                 try:
                     found = context.search(tool, query, request.limits.top_k)
                 except Exception as exc:
@@ -342,14 +450,31 @@ def run_research(
                     round_errors.append(f"검색 실패 ({query}): {exc}")
                     continue
                 before_count = len(sources)
+                successful_reads = 0
                 for document in found:
+                    if (
+                        successful_reads >= request.limits.research_read_limit
+                        or len(sources) >= request.limits.research_source_limit
+                    ):
+                        break
                     if document.source_id in sources:
+                        continue
+                    page_key = (
+                        document.file_path,
+                        document.metadata.get("file_sha256"),
+                        document.metadata.get("page"),
+                    )
+                    local_page = bool(all(page_key))
+                    if local_page and page_key in read_pages:
                         continue
                     try:
                         document = context.read(document)
                         if not document.content.strip():
                             raise ValueError("원문 본문이 비어 있습니다.")
                         sources[document.source_id] = document
+                        successful_reads += 1
+                        if local_page:
+                            read_pages.add(page_key)
                     except Exception as exc:
                         context.emit(
                             request,
@@ -380,26 +505,76 @@ def run_research(
                 "errors": round_errors,
             }
         )
+        if search_round > 0 and len(sources) == before_round:
+            stop_reason = "추가 검색에서 새 원문 없음, 확보한 결과와 한계 유지"
+            break
         if not sources:
             retry_feedback = ["검색 가능한 원문을 확보하지 못했습니다.", *round_errors]
             continue
         analysis_payload = {
             **current_payload,
             "search_queries": queries,
-            "sources": [item.model_dump(mode="json") for item in sources.values()],
+            "sources": research_sources(sources),
             "evidence_id_prefix": f"{agent}-",
             "reserved_evidence_ids": sorted(reserved_ids),
         }
         try:
             final_output = context.ask(
                 ResearchOutput,
-                prompt + "\n이전 검증 피드백과 기술 조사 결과를 분석에 반영한다.",
+                prompt + "\n이전 검증 피드백과 기술 조사 결과를 분석에 반영한다. "
+                "각 근거 카드는 해당 source_id의 excerpts에서 source_excerpt_id를 반드시 선택한다. "
+                "evidence_text는 선택한 발췌의 연속 원문만 복사한다. 번역, 요약, ... 결합은 금지한다. "
+                "여러 발췌가 필요하면 근거 카드를 나누고 판단의 evidence_ids에 함께 연결한다. "
+                "선택 발췌가 claim을 뒷받침하는지 확인한다.",
                 analysis_payload,
             )
         except Exception as exc:
             errors.append(f"{agent} 분석 LLM 호출 실패: {exc}")
             break
+        raw_diagnostics = citation_diagnostics(final_output, sources)
+        final_output, repairs = repair_source_links(final_output, sources)
         cards, findings, rejected = sanitize_research(final_output, sources, agent, reserved_ids)
+        citation_audit.append(
+            {
+                "round": search_round + 1,
+                "cards": raw_diagnostics,
+                "repairs": repairs,
+                "rejected": rejected,
+            }
+        )
+        if rejected and not repair_used and request.limits.max_search_retries > 0:
+            repair_used = True
+            try:
+                repaired = context.ask(
+                    ResearchOutput,
+                    prompt + "\n새 검색 없이 기존 sources와 excerpts만 사용해 출처 연결을 수정한다. "
+                    "source_excerpt_id를 정확히 선택하고, finding의 evidence_ids는 최종 카드 ID와 일치시킨다. "
+                    "기존 유효 카드는 유지하고 수정 불가능한 항목은 제외한다.",
+                    {
+                        **analysis_payload,
+                        "previous_output": final_output.model_dump(mode="json"),
+                        "citation_errors": rejected,
+                    },
+                )
+                repaired, repairs = repair_source_links(repaired, sources)
+                new_cards, new_findings, new_rejected = sanitize_research(
+                    repaired, sources, agent, reserved_ids
+                )
+                adopted = len(new_cards) >= len(cards) and len(new_findings) >= len(findings)
+                citation_audit.append(
+                    {
+                        "round": search_round + 1,
+                        "repair_only": True,
+                        "adopted": adopted,
+                        "cards": citation_diagnostics(repaired, sources),
+                        "repairs": repairs,
+                        "rejected": new_rejected,
+                    }
+                )
+                if adopted:
+                    final_output, cards, findings, rejected = repaired, new_cards, new_findings, new_rejected
+            except Exception as exc:
+                errors.append(f"기존 자료 인용 보정 실패: {type(exc).__name__}")
         gaps = list(dict.fromkeys([*final_output.missing_information, *rejected]))
         context.emit(
             request,
@@ -416,11 +591,11 @@ def run_research(
             gaps.append("검증 가능한 근거에 연결된 핵심 판단이 없습니다.")
         # Only missing evidence triggers another search; disclosed methodological
         # limitations remain in the result without forcing repetitive searches.
-        retry_feedback = list(
-            dict.fromkeys(
-                [*final_output.missing_information, *rejected, *([] if cards and findings else gaps)]
-            )
-        )
+        # Citation formatting errors are not a reason to fetch more documents.
+        retry_feedback = list(dict.fromkeys(final_output.missing_information))
+        if cards and findings and search_round >= 1:
+            stop_reason = "추가 조사 1회 완료, 남은 정보 부족은 보고서 한계로 유지"
+            break
         if not retry_feedback:
             break
     if final_output is None:
@@ -432,7 +607,7 @@ def run_research(
             sources=list(sources.values()),
             gaps=[*retry_feedback, message],
             errors=errors or [message],
-            data={"search_history": history},
+            data={"search_history": history, "citation_audit": citation_audit},
         )
     gaps = list(dict.fromkeys(gaps))
     if retry_feedback and len(history) >= request.limits.max_search_retries + 1:
@@ -442,7 +617,7 @@ def run_research(
     )
     follow_ups = (
         [FollowUpRequest(target_agent=agent, reason="근거 보완 필요", questions=retry_feedback)]
-        if retry_feedback
+        if retry_feedback and not (cards and findings) and not stop_reason
         else []
     )
     return result_for(
@@ -458,6 +633,8 @@ def run_research(
         follow_up_requests=follow_ups,
         data={
             "search_history": history,
+            "citation_audit": citation_audit,
+            "search_stop_reason": stop_reason,
             "limitations": final_output.limitations,
             "structured_output": [field.model_dump() for field in final_output.structured_output],
         },

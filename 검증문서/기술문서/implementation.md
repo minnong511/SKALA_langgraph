@@ -47,7 +47,7 @@ PDF는 한글 텍스트 추출, 내장 폰트, 긴 SUMMARY 초과 및 파일 충
 ## 실제 실행 전에 필요한 입력
 
 - 사용 가능한 정확한 `LLM_MODEL`과 OpenAI/Tavily API 키.
-- 제공된 `docs/CXL.pdf`, `docs/Turboquant.pdf`로 만든 인덱스(`RAW_DIR=docs` 설정).
+- 제공된 `data/raw/CXL.pdf`, `data/raw/Turboquant.pdf`로 만든 인덱스(`RAW_DIR=data/raw` 기본 설정).
 - 실제 계정에서의 모델 접근, Tavily 응답, BGE-M3 모델 다운로드와 품질은 아직 확인하지 않았습니다.
 - `--demo` 산출물은 합성 예시이며 기술별 주장이나 최종 제출 근거로 사용할 자료가 아닙니다.
 

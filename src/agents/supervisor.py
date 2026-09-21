@@ -99,6 +99,8 @@ def run(request: AgentRequest, context: AgentContext) -> AgentResult:
     results = context.results
 
     def can_retry(name):
+        if name in RESEARCH_AGENTS and context.budget is not None and context.budget.research_exhausted:
+            return False
         limit = (
             limits.max_report_revisions
             if name == "report"
@@ -196,7 +198,7 @@ def run(request: AgentRequest, context: AgentContext) -> AgentResult:
                     feedback.setdefault(verdict.target_agent, []).append(verdict.reason)
         for name in RESEARCH_AGENTS:
             result = results.get(name)
-            if not result or result.status != "completed":
+            if not result or result.status == "failed" or not result.evidence_cards or not result.findings:
                 feedback.setdefault(name, []).extend(
                     (result.gaps + result.errors)
                     if result

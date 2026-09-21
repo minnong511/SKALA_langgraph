@@ -51,6 +51,8 @@ def run(request: AgentRequest, context: AgentContext) -> AgentResult:
         chunk_count=len(sources),
     )
     for source_id, source in sources.items():
+        if source_id not in {card.source_id for card in cards}:
+            continue
         try:
             actual = context.read(source)
             if actual.source_id != source_id:
@@ -98,7 +100,7 @@ def run(request: AgentRequest, context: AgentContext) -> AgentResult:
                     if published_date > request.as_of_date:
                         issues.append("분석 기준일 이후에 발행된 출처")
                         hard_failures.add(card.evidence_id)
-                except (ValueError, TypeError, OverflowError):
+                except ValueError, TypeError, OverflowError:
                     issues.append("출처 발행일 형식을 확인할 수 없음")
         if not card.claim.strip():
             issues.append("빈 주장")

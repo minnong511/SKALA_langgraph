@@ -1,0 +1,51 @@
+{
+  "run_id": "20260921T213649-e5d155d9",
+  "mode": "demo",
+  "command": "python main.py --demo",
+  "status": "needs_review",
+  "review": {
+    "passed": true,
+    "issues": [],
+    "incomplete_agents": [],
+    "demo": true
+  },
+  "retry_counts": {
+    "technical": 0,
+    "market": 0,
+    "stakeholder": 0,
+    "domain": 0,
+    "verification": 0,
+    "synthesis": 0,
+    "report": 0
+  },
+  "unresolved": [
+    "예시 데이터입니다. 실제 기술 조사 결과가 아닙니다."
+  ],
+  "stages": {
+    "technical": "completed",
+    "market": "completed",
+    "stakeholder": "completed",
+    "domain": "completed",
+    "verification": "completed",
+    "synthesis": "completed",
+    "report": "completed"
+  },
+  "files": {
+    "draft-report.pdf": {
+      "exists": true,
+      "bytes": 47722
+    },
+    "draft-report.md": {
+      "exists": true,
+      "bytes": 2962
+    },
+    "result.json": {
+      "exists": true,
+      "bytes": 36583
+    },
+    "events.jsonl": {
+      "exists": true,
+      "bytes": 20334
+    }
+  }
+}

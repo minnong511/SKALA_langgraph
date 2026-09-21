@@ -54,6 +54,14 @@ def _settings() -> Settings:
     )
 
 
+def test_luna_routes_function_tools_through_responses_api():
+    settings = _settings().model_copy(update={"llm_model": "gpt-5.6-luna"})
+    llm = create_llm(settings)
+    runnable = llm.with_structured_output(ResearchOutput, method="function_calling", strict=False)
+    assert llm.use_responses_api is True
+    assert runnable is not None
+
+
 def _configured_llm(monkeypatch, client: httpx.Client) -> ChatOpenAI:
     """Keep production construction options, replacing only the HTTP transport."""
 

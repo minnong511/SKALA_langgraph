@@ -16,12 +16,13 @@ class BudgetExceeded(RuntimeError):
 
 
 class CallBudget:
-    def __init__(self, max_calls: int, max_seconds: float):
+    def __init__(self, max_calls: int, max_seconds: float, reserved_calls: int = 0):
         self.max_calls = max_calls
         self.max_seconds = max_seconds
         self.started = monotonic()
         self._lock = Lock()
         self.counts: Counter = Counter()
+        self.reserved_calls = min(reserved_calls, max_calls // 4)
 
     def check(self):
         if monotonic() - self.started >= self.max_seconds:
@@ -29,10 +30,33 @@ class CallBudget:
         if sum(self.counts.values()) >= self.max_calls:
             raise BudgetExceeded("전체 호출 한도에 도달했습니다.")
 
-    def consume(self, kind: str):
+    def consume(self, kind: str, *, research=False):
         with self._lock:
             self.check()
+            if research and sum(self.counts.values()) >= self.max_calls - self.reserved_calls:
+                raise BudgetExceeded("후속 검증 및 보고서를 위한 호출 예산 보존: 조사 호출 중단")
             self.counts[kind] += 1
+
+    @property
+    def research_exhausted(self):
+        with self._lock:
+            return sum(self.counts.values()) >= self.max_calls - self.reserved_calls
+
+    def snapshot(self):
+        """Return an atomic view for monitoring without consuming budget."""
+        with self._lock:
+            used = sum(self.counts.values())
+            elapsed = max(0.0, monotonic() - self.started)
+            return {
+                "used": used,
+                "limit": self.max_calls,
+                "remaining": max(0, self.max_calls - used),
+                "counts": dict(self.counts),
+                "reserved_calls": self.reserved_calls,
+                "elapsed": elapsed,
+                "seconds_limit": self.max_seconds,
+                "seconds_remaining": max(0.0, self.max_seconds - elapsed),
+            }
 
     @property
     def exhausted(self):
@@ -67,7 +91,9 @@ class AgentRuntime:
     def execute(
         self, name: str, agent: Callable, request: AgentRequest, results: dict[str, AgentResult]
     ) -> AgentResult:
-        context = replace(self.context, results=results, agent=name)
+        context = replace(
+            self.context, results=results, agent=name, task_id=request.task_id, attempt=request.attempt
+        )
         started = monotonic()
         stop = Event()
         context.emit(request, "agent_start", f"{name} 시작")
@@ -82,7 +108,9 @@ class AgentRuntime:
         thread.start()
         try:
             if context.budget:
-                context.budget.consume("agent")
+                context.budget.consume(
+                    "agent", research=name in ("technical", "market", "stakeholder", "domain")
+                )
             value = agent(request, context)
             result = value if isinstance(value, AgentResult) else AgentResult.model_validate(value)
             if (result.agent, result.task_id, result.attempt) != (name, request.task_id, request.attempt):

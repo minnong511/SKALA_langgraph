@@ -27,7 +27,7 @@ env/
 .DS_Store
 
 # Local research data, PDFs, indexes, and generated artifacts
-*.pdf
+*.[pP][dD][fF]
 /data/**
 !/data/raw/
 !/data/index/

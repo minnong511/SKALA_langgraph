@@ -23,6 +23,8 @@ def _font_candidates(font_path: Path | None) -> list[Path]:
     if configured:
         return [Path(configured).expanduser()]
     return [
+        Path("/System/Library/Fonts/Supplemental/AppleGothic.ttf"),
+        Path("/System/Library/Fonts/AppleGothic.ttf"),
         Path("/usr/share/fonts/truetype/nanum/NanumGothic.ttf"),
         Path("/usr/share/fonts/truetype/nanum/NanumBarunGothic.ttf"),
         Path("/usr/share/fonts/truetype/nanum/NanumMyeongjo.ttf"),
@@ -68,7 +70,7 @@ def _register_font(font_path: Path | None, markdown: str) -> tuple[str, Path]:
         except Exception as error:
             failures.append(f"{candidate}: {error}")
     reason = "; ".join(failures) or "No Korean TrueType font was found"
-    raise RuntimeError(f"{reason}. Install Nanum fonts or set PDF_FONT_PATH to a Korean .ttf font.")
+    raise RuntimeError(f"{reason}. Set PDF_FONT_PATH to a Korean .ttf font or install Nanum fonts.")
 
 
 def _inline(text: str) -> str:

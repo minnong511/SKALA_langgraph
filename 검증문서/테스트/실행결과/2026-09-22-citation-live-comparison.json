@@ -1,0 +1,34 @@
+{
+  "source_run": "20260921T215747-08f239fd",
+  "scope": "controlled technical citation reproduction, not full workflow",
+  "live_llm_calls": 2,
+  "baseline": {
+    "proposed": 6,
+    "exact_match": 0,
+    "ellipsis_quotes": 6
+  },
+  "fixed": {
+    "proposed": 8,
+    "accepted": 8,
+    "independent_page_recheck": 8,
+    "rejected": []
+  },
+  "extraction_audit": {
+    "attempt1": {
+      "records": 22,
+      "pages": 14,
+      "mismatches": 0
+    },
+    "attempt2": {
+      "records": 39,
+      "pages": 21,
+      "mismatches": 0
+    }
+  },
+  "limitations": [
+    "Historical rejected quotes were not persisted",
+    "Changed prompt and page deduplication together; not a single-factor ablation",
+    "Quote fidelity is separate from claim support",
+    "Full workflow call-budget completion not rerun"
+  ]
+}

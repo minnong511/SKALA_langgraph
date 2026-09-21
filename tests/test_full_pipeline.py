@@ -236,7 +236,7 @@ def test_all_actual_agents_complete_live_pipeline_and_publish_real_files(tmp_pat
         "ReportOutput": 1,
         "QualityOutput": 1,
     }
-    assert len(memory.read_calls) == 5  # Four research assignments and independent verification.
+    assert len(memory.read_calls) == 2  # Shared research read and independent verification.
     assert len(memory.search_calls) == 5  # Domain uses both retrieval and web search.
     expected_ids = {evidence_id(agent, technology) for agent in PERSPECTIVES for technology in TECHNOLOGIES}
     assert set(state["report_result"].used_evidence_ids) == expected_ids
