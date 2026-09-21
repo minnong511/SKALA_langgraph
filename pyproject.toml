@@ -1,0 +1,41 @@
+[build-system]
+requires = ["setuptools>=75"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "skala-langgraph"
+version = "0.1.0"
+description = "Evidence-grounded multi-agent technology evaluation"
+requires-python = ">=3.11,<3.14"
+dependencies = [
+  "pydantic>=2.10,<3", "python-dotenv>=1.0,<2", "langgraph>=1.0,<2",
+  "langchain-core>=1.0,<2", "langchain-openai>=1.0,<2",
+  "httpx>=0.28,<1", "pypdf>=5,<7", "reportlab>=4.2,<5",
+]
+
+[project.optional-dependencies]
+rag = ["faiss-cpu>=1.9,<2", "sentence-transformers>=3.3,<6", "numpy>=1.26,<3"]
+dev = ["pytest>=8,<10", "ruff>=0.9,<1"]
+
+[project.scripts]
+skala-evaluate = "main:cli"
+
+[tool.setuptools]
+py-modules = ["main"]
+
+[tool.setuptools.package-data]
+prompts = ["*.md"]
+
+[tool.setuptools.packages.find]
+include = ["src*", "scripts*", "prompts*"]
+exclude = ["src.legacy*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 110
+exclude = ["src/legacy"]
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "I"]

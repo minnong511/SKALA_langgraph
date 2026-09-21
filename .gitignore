@@ -25,3 +25,13 @@ env/
 
 # macOS
 .DS_Store
+
+# Local research data, PDFs, indexes, and generated artifacts
+*.pdf
+/data/**
+!/data/raw/
+!/data/index/
+!/data/raw/.gitkeep
+!/data/index/.gitkeep
+/outputs/**
+!/outputs/.gitkeep
