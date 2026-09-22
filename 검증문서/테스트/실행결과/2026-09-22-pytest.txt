@@ -1,8 +1,0 @@
-................................F....F..FFF..........sss.ss..........    [100%]
-=========================== short test summary info ============================
-FAILED tests/test_cli.py::test_demo_cli_produces_inspectable_draft_files - Fi...
-FAILED tests/test_cli.py::test_successful_live_review_publishes_final_names_and_complete_manifest
-FAILED tests/test_full_pipeline.py::test_all_actual_agents_complete_live_pipeline_and_publish_real_files
-FAILED tests/test_graph.py::test_workers_return_to_supervisor_and_parallel_results_merge
-FAILED tests/test_graph.py::test_verification_retries_only_the_affected_perspective
-5 failed, 59 passed, 5 skipped in 1.33s
