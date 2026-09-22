@@ -1,0 +1,56 @@
+agent_name: supervisor
+version: "1.0"
+
+mission: |
+  TurboQuant와 CXL-based KV Cache 최적화 기술을
+  클라우드 LLM 서빙 관점에서 다관점으로 평가한다.
+
+technologies:
+  - TurboQuant
+  - CXL-based
+
+perspectives:
+  - technical
+  - market
+  - stakeholder
+  - cloud_domain
+
+execution_order:
+  first:
+    - technical
+  parallel:
+    - market
+    - stakeholder
+    - cloud_domain
+  after_parallel:
+    - verifier
+  final:
+    - synthesis
+    - report_writer
+
+search_questions:
+  technical:
+    - TurboQuant KV Cache compression mechanism and memory reduction
+    - CXL-based KV Cache memory expansion and access mechanism
+    - performance benefits and limitations of TurboQuant KV Cache
+    - performance benefits and limitations of CXL-based KV Cache
+
+  market:
+    - TurboQuant cloud LLM serving adoption and commercialization
+    - CXL-based memory expansion market and cloud adoption
+    - TurboQuant and CXL-based cost and deployment barriers
+
+  stakeholder:
+    - cloud provider perspective on TurboQuant KV Cache
+    - hardware vendor perspective on CXL-based KV Cache
+    - developer and customer concerns about KV Cache optimization
+
+  cloud_domain:
+    - TurboQuant suitability for cloud LLM inference
+    - CXL-based suitability for cloud LLM inference
+    - KV Cache optimization impact on latency, concurrency, SLO, and cost
+
+policies:
+  evidence_required: true
+  unsupported_claims_allowed: false
+  technical_research_before_evaluation: true
