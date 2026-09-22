@@ -723,6 +723,7 @@ def evidence_verification_agent(state: GlobalState) -> dict[str, Any]:
         return {
             **_empty_verification_result("검증할 근거 카드가 없습니다."),
             "verified_evidence_cards": [],
+            "usable_evidence_cards": [],
         }
 
     graph_result = EVIDENCE_VERIFICATION_GRAPH.invoke(
@@ -749,7 +750,11 @@ def evidence_verification_agent(state: GlobalState) -> dict[str, Any]:
     verified_cards = verification_result["payload"].get(
         "verified_evidence_cards", []
     )
+    partial_cards = verification_result["payload"].get(
+        "partially_verified_cards", []
+    )
     return {
         "verification_result": verification_result,
         "verified_evidence_cards": deepcopy(verified_cards),
+        "usable_evidence_cards": deepcopy([*verified_cards, *partial_cards]),
     }

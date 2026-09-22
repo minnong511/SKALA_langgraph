@@ -4,18 +4,18 @@
 # 처리 오류: 해당 노드 → failure → END
 # 외부 반환: {"synthesis_result": AgentResult}, 내부 상태: SynthesisState
 
-"""평가 종합 에이전트: 검증된 근거의 비교와 조건부 판단.
+"""평가 종합 에이전트: 검증 근거의 비교와 조건부 판단.
 
 인풋:
     GlobalState의 user_query, technical_result, market_result,
     stakeholder_result, cloud_domain_result, verification_result,
-    evidence_cards, verified_evidence_cards.
+    evidence_cards, verified_evidence_cards, usable_evidence_cards.
     작성 지침은 prompts/synthesis.yaml에서 로드.
 함수 기능:
     synthesis_agent: 내부 LangGraph 호출 후 기존 반환 형식으로 결과 전달.
     build_synthesis_graph: 설정 → 선별 → 생성 → 검증 → 결과 조립 노드 연결.
     조건부 경로: 근거 부족은 insufficient, 처리 오류는 failure 노드로 이동.
-    _verified_cards: 명시적 verified 판정과 출처를 갖춘 카드만 선별.
+    _verified_cards: verified 또는 partially_verified 카드를 선별.
     _validate_statement / _validate_numbers: 근거 ID와 숫자의 출처 존재 확인.
     _result: 기존 AgentResult 필드에 결과, 한계, 오류 구성.
 아웃풋:
@@ -32,7 +32,7 @@
         user_query: str
         technical_result, market_result, stakeholder_result,
         cloud_domain_result, verification_result: AgentResult
-        evidence_cards, verified_evidence_cards: list[EvidenceCard]
+        evidence_cards, verified_evidence_cards, usable_evidence_cards: list[EvidenceCard]
     GlobalState와 AgentResult는 TypedDict(total=False)로 정의된 딕셔너리.
     아래는 타입 설명용 표기이며 실제 값은 해당 자료형의 데이터로 전달.
 
@@ -59,7 +59,7 @@
 
     실제 payload에는 모델 객체가 아닌 model_dump() 결과인 dict와 list 저장.
     Statement 형식: {"text": str, "evidence_ids": list[str],
-                     "claim_type": "fact" | "inference"}
+                     "claim_type": "fact" | "inference" | "limitation"}
     Comparison 형식: Statement 필드 + "perspective" 필드.
     perspective 값: technical | market | stakeholder | cloud_domain.
     근거 부족으로 생성 생략 또는 처리 실패 시 payload는 빈 딕셔너리.
@@ -90,7 +90,7 @@ class Statement(BaseModel):
     model_config = ConfigDict(extra="forbid")
     text: str = Field(min_length=1)
     evidence_ids: list[str] = Field(min_length=1)
-    claim_type: Literal["fact", "inference"]
+    claim_type: Literal["fact", "inference", "limitation"]
 
 
 class Comparison(Statement):
@@ -125,38 +125,52 @@ def _load_config(path: Path) -> dict[str, Any]:
 
 
 def _verified_cards(state: GlobalState) -> tuple[dict[str, dict], list[str]]:
-    """GlobalState의 검증 완료 카드만 종합 입력으로 선별한다."""
+    """GlobalState의 검증·부분 검증 카드를 잠정 종합 입력으로 선별한다."""
     cards: dict[str, dict] = {}
-    for card in state.get("verified_evidence_cards", []):
+    for card in state.get("usable_evidence_cards", []):
         key = card.get("evidence_id")
         if not isinstance(key, str) or not key.strip():
             raise ValueError("Missing evidence ID")
         if key in cards and cards[key] != card:
             raise ValueError("Conflicting evidence ID")
         cards[key] = deepcopy(card)
-    if state.get("verification_result", {}).get("status") != "ok":
-        return {}, ["근거 검증 완료 상태 미확보"]
+    verification_status = state.get("verification_result", {}).get("status")
+    if verification_status not in {"ok", "insufficient_evidence"}:
+        return {}, ["사용 가능한 근거 검증 결과 미확보"]
     allowed = {
         key: card
         for key, card in cards.items()
-        if card.get("verification_status") == "verified"
+        if card.get("verification_status")
+        in {"verified", "partially_verified"}
         and all(
             isinstance(card.get(k), str) and card[k].strip()
             for k in ("claim", "evidence_text", "source_title", "source_url")
         )
     }
     limitations = []
+    if any(
+        card.get("verification_status") == "partially_verified"
+        for card in allowed.values()
+    ):
+        limitations.append(
+            "부분 검증 근거를 포함한 잠정 평가이며 확정적 사실로 해석하면 안 됩니다."
+        )
     if len(allowed) != len(cards):
-        limitations.append("미검증, 부분 검증, 거절 또는 출처 불완전 근거 제외")
+        limitations.append("미검증, 거절 또는 출처 불완전 근거는 제외했습니다.")
     return allowed, limitations
 
 
 def _validate_statement(statement: Statement, cards: dict[str, dict]) -> None:
-    """생성 주장과 허용 카드 입력 → ID, 빈 문장, 숫자 검사 → 실패 시 예외."""
+    """생성 주장과 허용 카드 입력 → ID, 유형, 빈 문장, 숫자 검사 → 실패 시 예외."""
     if not set(statement.evidence_ids) <= cards.keys():
         raise ValueError("Unknown evidence ID")
     if not statement.text.strip():
         raise ValueError("Empty statement")
+    if statement.claim_type == "fact" and any(
+        cards[evidence_id].get("verification_status") == "partially_verified"
+        for evidence_id in statement.evidence_ids
+    ):
+        raise ValueError("Partially verified evidence cannot support fact")
     _validate_numbers(statement.text, statement.evidence_ids, cards)
 
 
@@ -170,6 +184,72 @@ def _validate_numbers(text: str, ids: list[str], cards: dict[str, dict]) -> None
     )
     if not set(re.findall(pattern, text)) <= set(re.findall(pattern, source)):
         raise ValueError("Numeric claim absent from cited evidence")
+
+
+def _validation_error_code(error: ValueError) -> str:
+    """검증 예외를 로그용 비민감 오류 코드로 변환한다."""
+    labels = (
+        ("Unknown evidence ID", "unknown_evidence_id"),
+        ("Empty statement", "empty_statement"),
+        (
+            "Partially verified evidence cannot support fact",
+            "partial_card_fact",
+        ),
+        ("Numeric claim absent from cited evidence", "fabricated_number"),
+        ("Comparison perspective mismatch", "perspective_mismatch"),
+    )
+    message = str(error)
+    for fragment, label in labels:
+        if fragment in message:
+            return label
+    return "validation_error"
+
+
+def _statement_diagnostic(
+    error: ValueError,
+    group: str,
+    index: int,
+    statement: Statement,
+    cards: dict[str, dict],
+) -> dict[str, Any]:
+    """주장 검증 실패를 재현 가능한 최소 정보로 기록한다."""
+    evidence_ids = list(statement.evidence_ids)
+    return {
+        "node": "_validate_synthesis",
+        "check": _validation_error_code(error),
+        "statement_group": group,
+        "statement_index": index,
+        "claim_type": statement.claim_type,
+        "evidence_ids": evidence_ids,
+        "evidence_statuses": {
+            evidence_id: cards.get(evidence_id, {}).get(
+                "verification_status", "missing"
+            )
+            for evidence_id in evidence_ids
+        },
+        "text_preview": statement.text[:200],
+    }
+
+
+def _perspective_diagnostic(
+    row_index: int, row: Comparison, cards: dict[str, dict]
+) -> dict[str, Any]:
+    """비교 관점과 카드 관점 불일치 정보를 기록한다."""
+    return {
+        "node": "_validate_synthesis",
+        "check": "perspective_mismatch",
+        "statement_group": "comparison_rows",
+        "statement_index": row_index,
+        "perspective": row.perspective,
+        "evidence_ids": list(row.evidence_ids),
+        "evidence_perspectives": {
+            evidence_id: cards.get(evidence_id, {}).get(
+                "perspective", "missing"
+            )
+            for evidence_id in row.evidence_ids
+        },
+        "text_preview": row.text[:200],
+    }
 
 
 def _result(
@@ -206,6 +286,7 @@ class SynthesisState(TypedDict, total=False):
     complete: bool
     evidence_ids: list[str]
     error_type: str
+    diagnostics: list[dict[str, Any]]
     output: dict[str, Any]
 
 
@@ -217,7 +298,16 @@ def _guard_node(node):
         try:
             return node(state)
         except Exception as error:  # noqa: BLE001 - 노드 경계의 안전한 오류 변환
-            return {"error_type": type(error).__name__}
+            return {
+                "error_type": f"{node.__name__}:{type(error).__name__}",
+                "diagnostics": [
+                    {
+                        "node": node.__name__,
+                        "check": "unhandled_exception",
+                        "error_type": type(error).__name__,
+                    }
+                ],
+            }
 
     return guarded
 
@@ -301,20 +391,41 @@ def _validate_synthesis(local: SynthesisState) -> dict:
     draft = SynthesisDraft.model_validate(local["response"])
     cards = local["cards"]
     limitations = list(local["limitations"])
-    statements = [
-        *draft.summary,
-        *draft.comparison_rows,
-        *draft.agreements,
-        *draft.conflicts,
-        *draft.conditional_recommendations,
-    ]
-    for statement in statements:
-        _validate_statement(statement, cards)
-    for row in draft.comparison_rows:
+    statement_groups = (
+        ("summary", draft.summary),
+        ("comparison_rows", draft.comparison_rows),
+        ("agreements", draft.agreements),
+        ("conflicts", draft.conflicts),
+        ("conditional_recommendations", draft.conditional_recommendations),
+    )
+    statements = []
+    for group_name, group in statement_groups:
+        for index, statement in enumerate(group):
+            try:
+                _validate_statement(statement, cards)
+            except ValueError as error:
+                return {
+                    "error_type": (
+                        "_validate_synthesis:ValueError:"
+                        f"{_validation_error_code(error)}"
+                    ),
+                    "diagnostics": [
+                        _statement_diagnostic(
+                            error, group_name, index, statement, cards
+                        )
+                    ],
+                }
+            statements.append(statement)
+    for row_index, row in enumerate(draft.comparison_rows):
         if any(
             cards[i].get("perspective") != row.perspective for i in row.evidence_ids
         ):
-            raise ValueError("Comparison perspective mismatch")
+            return {
+                "error_type": "_validate_synthesis:ValueError:perspective_mismatch",
+                "diagnostics": [
+                    _perspective_diagnostic(row_index, row, cards)
+                ],
+            }
     covered = {row.perspective for row in draft.comparison_rows}
     for p in PERSPECTIVES:
         if p not in covered:
@@ -369,11 +480,13 @@ def _insufficient_result(local: SynthesisState) -> dict:
 
 def _synthesis_failure(local: SynthesisState) -> dict:
     """오류 노드의 종료 결과. 원본 예외 메시지는 외부로 전달하지 않음."""
+    diagnostics = local.get("diagnostics", [])
     return {
         "output": _result(
             "failed",
             "평가 종합 실패",
             errors=[f"종합 처리 오류 ({local['error_type']})"],
+            payload={"diagnostics": diagnostics} if diagnostics else {},
         )
     }
 
@@ -417,4 +530,15 @@ def synthesis_agent(state: GlobalState) -> dict[str, Any]:
         result = build_synthesis_graph().invoke({"request": deepcopy(state)})
         return result["output"]
     except Exception as error:  # noqa: BLE001 - 그래프 실행 경계의 오류 처리
-        return _synthesis_failure({"error_type": type(error).__name__})["output"]
+        return _synthesis_failure(
+            {
+                "error_type": f"synthesis_agent:{type(error).__name__}",
+                "diagnostics": [
+                    {
+                        "node": "synthesis_agent",
+                        "check": "unhandled_exception",
+                        "error_type": type(error).__name__,
+                    }
+                ],
+            }
+        )["output"]

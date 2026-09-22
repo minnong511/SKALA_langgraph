@@ -9,7 +9,8 @@
 
 인풋:
     GlobalState의 user_query, synthesis_result, verification_result,
-    evidence_cards, 선택 입력 research_plan.
+    evidence_cards, verified_evidence_cards, usable_evidence_cards,
+    선택 입력 research_plan.
     목차와 절별 지침은 prompts/report_writer.yaml에서 로드.
 
 함수 기능:
@@ -33,7 +34,7 @@
     입력 필드:
         user_query: str
         synthesis_result, verification_result: AgentResult
-        evidence_cards, verified_evidence_cards: list[EvidenceCard]
+    evidence_cards, verified_evidence_cards, usable_evidence_cards: list[EvidenceCard]
         research_plan: ResearchPlan  # 선택 입력
     반환 구조: {"final_report": str}
     정상 문자열 구조: SUMMARY → 본문 6개 장과 하위 절 20개 → REFERENCE.
@@ -64,7 +65,7 @@ LLM 내부 응답 형식:
 import json
 import re
 from copy import deepcopy
-from functools import lru_cache
+from functools import lru_cache, wraps
 from pathlib import Path
 from typing import Any, Literal, TypedDict
 
@@ -73,7 +74,6 @@ from langgraph.graph import END, START, StateGraph
 from pydantic import BaseModel, ConfigDict, Field
 
 from kv_cache_agent.agents.synthesis import (
-    _guard_node,
     _load_config,
     _route_error,
     _validate_numbers,
@@ -93,6 +93,9 @@ TITLES = [
     "6. 한계점",
     "REFERENCE",
 ]
+INLINE_EVIDENCE_ARTIFACT = re.compile(
+    r"\s*\(\s*evidence_ids\s*:\s*\[[^\]]*\]\s*\)"
+)
 
 
 class Paragraph(BaseModel):
@@ -158,6 +161,67 @@ def _plain(text: str) -> str:
     # LLM 본문이나 외부 메타데이터로 제목, 링크, 인용 번호를 삽입하지 않도록 처리.
     """본문 또는 메타데이터 입력 → 구조용 문자와 줄바꿈 정리 → 표시 문자열 반환."""
     return re.sub(r"[\[\]#<>`*]", "", " ".join(text.split()))
+
+
+def _remove_inline_evidence_artifact(text: str) -> str:
+    """LLM이 본문에 중복 출력한 구조화 필드 표기를 제거한다."""
+    return INLINE_EVIDENCE_ARTIFACT.sub("", text).strip()
+
+
+def _normalize_sections(
+    draft: ReportDraft,
+    expected_ids: list[str],
+    limitations: list[str],
+) -> list[Section]:
+    """LLM 절 목록을 목차 순서로 정규화하고 누락 절을 판단 보류로 보완한다."""
+    expected = set(expected_ids)
+    grouped: dict[str, Section] = {}
+    duplicate_ids: list[str] = []
+    unknown_ids: list[str] = []
+
+    for section in draft.sections:
+        section_id = section.section_id.strip()
+        if section_id not in expected:
+            unknown_ids.append(section_id or "<empty>")
+            continue
+        if section_id in grouped:
+            grouped[section_id].paragraphs.extend(section.paragraphs)
+            duplicate_ids.append(section_id)
+            continue
+        section.section_id = section_id
+        grouped[section_id] = section
+
+    normalized: list[Section] = []
+    for section_id in expected_ids:
+        section = grouped.get(section_id)
+        if section is None:
+            normalized.append(
+                Section(
+                    section_id=section_id,
+                    paragraphs=[
+                        Paragraph(
+                            text="검증 가능한 근거가 부족하여 이 항목의 판단을 보류한다.",
+                            claim_type="limitation",
+                            evidence_ids=[],
+                        )
+                    ],
+                )
+            )
+            limitations.append(f"{section_id}: 보고서 초안에서 절이 누락되어 판단 보류")
+            continue
+        normalized.append(section)
+
+    if duplicate_ids:
+        limitations.append(
+            "보고서 초안의 중복 절을 하나의 절로 합쳐 정규화했습니다: "
+            + ", ".join(dict.fromkeys(duplicate_ids))
+        )
+    if unknown_ids:
+        limitations.append(
+            "보고서 목차에 없는 절을 제외했습니다: "
+            + ", ".join(dict.fromkeys(unknown_ids))
+        )
+    return normalized
 
 
 def _render_markdown(
@@ -238,13 +302,54 @@ class ReportState(TypedDict, total=False):
     output: dict[str, str]
 
 
-@_guard_node
+def _report_guard(node):
+    """보고서 노드 예외를 노드명과 함께 안전한 오류 상태로 변환."""
+
+    error_labels = (
+        ("Invalid synthesis evidence IDs", "invalid_synthesis_evidence_ids"),
+        ("Missing or duplicate section", "missing_or_duplicate_section"),
+        ("Unknown citation", "unknown_citation"),
+        ("Uncited assertion", "uncited_assertion"),
+        (
+            "Partially verified evidence cannot support fact",
+            "partial_card_fact",
+        ),
+        (
+            "Numeric claim absent from cited evidence",
+            "fabricated_number",
+        ),
+        ("Inline citation or heading is not permitted", "inline_artifact"),
+        ("Rendered outline mismatch", "rendered_outline_mismatch"),
+    )
+
+    def error_label(error: Exception) -> str:
+        message = str(error)
+        for fragment, label in error_labels:
+            if fragment in message:
+                return label
+        return type(error).__name__
+
+    @wraps(node)
+    def guarded(state):
+        try:
+            return node(state)
+        except Exception as error:  # noqa: BLE001 - 노드 경계의 안전한 오류 변환
+            return {
+                "error_type": (
+                    f"{node.__name__}:{type(error).__name__}:{error_label(error)}"
+                )
+            }
+
+    return guarded
+
+
+@_report_guard
 def _load_report_config(local: ReportState) -> dict:
     """입력: 내부 상태 → 처리: YAML과 목차 검사 → 출력: config."""
     return {"config": _load_prompt_config()}
 
 
-@_guard_node
+@_report_guard
 def _prepare_report_context(local: ReportState) -> dict:
     """입력: request → 처리: 종합 상태와 허용 근거 확인 → 출력: 생성 또는 안내 자료."""
     state = local["request"]
@@ -263,7 +368,13 @@ def _prepare_report_context(local: ReportState) -> dict:
             "fallback_reason": "검증 완료 근거 부족으로 판단 보류",
             "limitations": [*limitations, *result.get("limitations", [])],
         }
-    return {"cards": cards, "result": result}
+    return {
+        "cards": cards,
+        "result": result,
+        "limitations": list(
+            dict.fromkeys([*limitations, *result.get("limitations", [])])
+        ),
+    }
 
 
 def _route_report_input(local: ReportState) -> str:
@@ -273,7 +384,7 @@ def _route_report_input(local: ReportState) -> str:
     return "fallback" if local.get("fallback_reason") else "ready"
 
 
-@_guard_node
+@_report_guard
 def _generate_sections(local: ReportState) -> dict:
     """입력: 종합과 근거, YAML → 처리: LLM 1회 호출 → 출력: response."""
     state, cards, config = local["request"], local["cards"], local["config"]
@@ -283,8 +394,12 @@ def _generate_sections(local: ReportState) -> dict:
         "synthesis_result": result,
         "evidence_cards": list(cards.values()),
         "verification_result": state.get("verification_result", {}),
+        "limitations": local.get("limitations", []),
         "research_plan": state.get("research_plan", {}),
         "report_structure": config["report_structure"],
+        "required_section_ids": [
+            section["id"] for section in _body_sections(config)
+        ],
         "reference_formats": config.get("reference_formats", {}),
         "summary_layout_target": config.get("summary_layout_target", {}),
     }
@@ -301,35 +416,45 @@ def _generate_sections(local: ReportState) -> dict:
     return {"response": response}
 
 
-@_guard_node
+@_report_guard
 def _validate_sections(local: ReportState) -> dict:
     """입력: response → 처리: 절 ID, 인용, 수치 검사 → 출력: sections."""
     response, cards = local["response"], local["cards"]
-    result = local["result"]
+    limitations = list(local.get("limitations", []))
     outline = _body_sections(local["config"])
     draft = ReportDraft.model_validate(response)
-    expected = [s["id"] for s in outline]
-    actual = [s.section_id for s in draft.sections]
-    if len(actual) != len(set(actual)) or set(actual) != set(expected):
-        raise ValueError("Missing or duplicate section")
+    # 근거는 evidence_ids 필드로만 관리하고, 본문에 중복된 내부 표기는 제거한다.
     for section in draft.sections:
+        for paragraph in section.paragraphs:
+            paragraph.text = _remove_inline_evidence_artifact(paragraph.text)
+    expected = [s["id"] for s in outline]
+    sections_to_validate = _normalize_sections(draft, expected, limitations)
+    for section in sections_to_validate:
         for paragraph in section.paragraphs:
             if not set(paragraph.evidence_ids) <= cards.keys():
                 raise ValueError("Unknown citation")
             if paragraph.claim_type != "limitation" and not paragraph.evidence_ids:
                 raise ValueError("Uncited assertion")
+            if paragraph.claim_type == "fact" and any(
+                cards[evidence_id].get("verification_status")
+                == "partially_verified"
+                for evidence_id in paragraph.evidence_ids
+            ):
+                raise ValueError(
+                    "Partially verified evidence cannot support fact"
+                )
             if paragraph.claim_type != "limitation":
                 _validate_numbers(paragraph.text, paragraph.evidence_ids, cards)
             if not paragraph.text.strip() or re.search(
                 r"\[[^]]+\]|^\s*#", paragraph.text
             ):
                 raise ValueError("Inline citation or heading is not permitted")
-    sections = {s.section_id: s.paragraphs for s in draft.sections}
+    sections = {s.section_id: s.paragraphs for s in sections_to_validate}
     # 상류에서 확인한 자료 부족은 LLM의 누락 여부와 무관하게 보고서에 보존.
-    if result.get("limitations"):
+    if limitations:
         sections["section_6_1"].append(
             Paragraph(
-                text=" / ".join(result["limitations"]),
+                text=" / ".join(limitations),
                 claim_type="limitation",
                 evidence_ids=[],
             )
@@ -337,7 +462,7 @@ def _validate_sections(local: ReportState) -> dict:
     return {"sections": sections}
 
 
-@_guard_node
+@_report_guard
 def _render_report(local: ReportState) -> dict:
     """입력: 검사된 절과 근거 → 처리: 제목과 참고문헌 조립 → 출력: markdown."""
     return {
@@ -345,7 +470,7 @@ def _render_report(local: ReportState) -> dict:
     }
 
 
-@_guard_node
+@_report_guard
 def _validate_report(local: ReportState) -> dict:
     """입력: markdown → 처리: 최종 제목 순서 검사 → 출력: 기존 final_report 형식."""
     markdown = local["markdown"]
@@ -354,7 +479,7 @@ def _validate_report(local: ReportState) -> dict:
     return {"output": {"final_report": markdown}}
 
 
-@_guard_node
+@_report_guard
 def _build_fallback_report(local: ReportState) -> dict:
     """자료 부족 안내도 지정 목차로 구성한 뒤 최종 검사 노드로 전달."""
     return {
@@ -412,4 +537,6 @@ def report_writer_agent(state: GlobalState) -> dict[str, Any]:
         result = build_report_graph().invoke({"request": deepcopy(state)})
         return result["output"]
     except Exception as error:  # noqa: BLE001 - 그래프 실행 경계의 오류 처리
-        return _report_failure({"error_type": type(error).__name__})["output"]
+        return _report_failure(
+            {"error_type": f"report_writer_agent:{type(error).__name__}"}
+        )["output"]

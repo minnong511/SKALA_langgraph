@@ -51,6 +51,7 @@ def verified(state):
     for card in state["evidence_cards"]:
         card["verification_status"] = "verified"
     state["verified_evidence_cards"] = deepcopy(state["evidence_cards"])
+    state["usable_evidence_cards"] = deepcopy(state["evidence_cards"])
     return state
 
 
@@ -119,6 +120,7 @@ def test_synthesis_consumes_explicit_global_verified_cards(state, monkeypatch):
     for card in verified_cards:
         card["verification_status"] = "verified"
     state["verified_evidence_cards"] = verified_cards
+    state["usable_evidence_cards"] = deepcopy(verified_cards)
 
     loader, _ = install_llm(monkeypatch, draft(state))
     output = module.synthesis_agent(state)["synthesis_result"]
@@ -129,6 +131,80 @@ def test_synthesis_consumes_explicit_global_verified_cards(state, monkeypatch):
         card["verification_status"] == "unverified"
         for card in state["evidence_cards"]
     )
+
+
+def test_synthesis_uses_partial_cards_as_provisional_evidence(state, monkeypatch):
+    """부분 검증 카드를 사용하되 종합 상태는 자료 부족으로 유지하는지 확인."""
+    partial_cards = deepcopy(state["evidence_cards"])
+    for card in partial_cards:
+        card["verification_status"] = "partially_verified"
+    state["verification_result"] = {
+        "status": "insufficient_evidence",
+        "limitations": ["원문 접근 차단으로 일부 카드만 확인"],
+    }
+    state["usable_evidence_cards"] = partial_cards
+
+    loader, _ = install_llm(monkeypatch, draft(state))
+    output = module.synthesis_agent(state)["synthesis_result"]
+
+    assert output["status"] == "insufficient_evidence"
+    assert output["evidence_ids"]
+    assert any("부분 검증" in item for item in output["limitations"])
+    loader.assert_called_once()
+
+
+def test_synthesis_rejects_partial_card_as_fact(state, monkeypatch):
+    """부분 검증 카드를 사실 문장으로 사용하면 종합을 실패시킨다."""
+    partial_cards = deepcopy(state["evidence_cards"])
+    for card in partial_cards:
+        card["verification_status"] = "partially_verified"
+    state["verification_result"] = {"status": "insufficient_evidence"}
+    state["usable_evidence_cards"] = partial_cards
+    response = draft(state)
+    response["summary"][0]["claim_type"] = "fact"
+    install_llm(monkeypatch, response)
+
+    output = module.synthesis_agent(state)["synthesis_result"]
+
+    assert output["status"] == "failed"
+    assert output["payload"]["diagnostics"][0]["check"] == "partial_card_fact"
+
+
+def test_synthesis_failure_identifies_failing_node(state, monkeypatch):
+    """종합 노드 오류가 발생하면 안전한 실패 결과에 노드명이 포함되는지 확인."""
+    verified_state = verified(state)
+    response = draft(verified_state)
+    response["summary"][0]["evidence_ids"] = ["invented"]
+    install_llm(monkeypatch, response)
+
+    output = module.synthesis_agent(verified_state)["synthesis_result"]
+
+    assert output["status"] == "failed"
+    assert "_validate_synthesis:ValueError:unknown_evidence_id" in output[
+        "errors"
+    ][0]
+    assert output["payload"]["diagnostics"][0]["evidence_statuses"] == {
+        "invented": "missing"
+    }
+
+
+def test_synthesis_accepts_partial_card_as_limitation(state, monkeypatch):
+    """부분 검증 근거를 limitation 문장으로 반환하면 정상 종합하는지 확인."""
+    partial_cards = deepcopy(state["evidence_cards"])
+    for card in partial_cards:
+        card["verification_status"] = "partially_verified"
+    state["verification_result"] = {
+        "status": "insufficient_evidence",
+        "limitations": ["원문 접근 차단으로 일부 카드만 확인"],
+    }
+    state["usable_evidence_cards"] = partial_cards
+    response = draft(state)
+    response["summary"][0]["claim_type"] = "limitation"
+    install_llm(monkeypatch, response)
+
+    output = module.synthesis_agent(state)["synthesis_result"]
+
+    assert output["status"] == "insufficient_evidence"
 
 
 def test_four_perspectives_success(state, monkeypatch):
@@ -145,6 +221,7 @@ def test_four_perspectives_success(state, monkeypatch):
             )
             state["evidence_cards"].append(card)
             state["verified_evidence_cards"].append(deepcopy(card))
+            state["usable_evidence_cards"].append(deepcopy(card))
     response = draft(state)
     response["comparison_rows"] = [
         {
@@ -192,6 +269,7 @@ def test_conflicting_duplicate_fails(state, monkeypatch):
     other["claim"] = "충돌하는 내용"
     state["evidence_cards"].append(other)
     state["verified_evidence_cards"].append(deepcopy(other))
+    state["usable_evidence_cards"].append(deepcopy(other))
     loader, _ = install_llm(monkeypatch, {})
     # 결과 확인: 아래 assert 조건 중 하나라도 다르면 테스트 실패.
     assert module.synthesis_agent(state)["synthesis_result"]["status"] == "failed"
@@ -225,7 +303,9 @@ def test_fabricated_number_rejected(state, monkeypatch):
     reply["summary"][0]["text"] = "처리량이 98765% 증가"
     install_llm(monkeypatch, reply)
     # 결과 확인: 아래 assert 조건 중 하나라도 다르면 테스트 실패.
-    assert module.synthesis_agent(state)["synthesis_result"]["status"] == "failed"
+    output = module.synthesis_agent(state)["synthesis_result"]
+    assert output["status"] == "failed"
+    assert output["payload"]["diagnostics"][0]["check"] == "fabricated_number"
 
 
 def test_missing_verification_prevents_llm(state, monkeypatch):

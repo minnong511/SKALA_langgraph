@@ -37,6 +37,8 @@ class GlobalState(TypedDict, total=False):
     evidence_cards: Annotated[list[EvidenceCard], operator.add]
     # 검증기가 확정한 카드만 별도 필드로 전달하여 종합 단계의 입력으로 사용한다.
     verified_evidence_cards: list[EvidenceCard]
+    # 검증 완료와 부분 검증 카드를 합친 잠정 보고서 작성용 입력이다.
+    usable_evidence_cards: list[EvidenceCard]
 
     verification_result: AgentResult
     synthesis_result: AgentResult

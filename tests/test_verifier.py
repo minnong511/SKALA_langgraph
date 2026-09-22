@@ -160,6 +160,9 @@ def test_verifier_returns_common_result_and_verified_cards(monkeypatch) -> None:
     assert result["verified_evidence_cards"] == agent_result["payload"][
         "verified_evidence_cards"
     ]
+    assert result["usable_evidence_cards"] == agent_result["payload"][
+        "verified_evidence_cards"
+    ]
     assert agent_result["payload"]["partially_verified_cards"] == []
     assert agent_result["payload"]["unsupported_cards"] == []
     assert agent_result["payload"]["retry_count"] == 0
@@ -194,6 +197,9 @@ def test_verifier_uses_tavily_excerpt_as_partial_fallback(monkeypatch) -> None:
         "원문 접근 차단" in card["caveat"]
         for card in agent_result["payload"]["partially_verified_cards"]
     )
+    assert result["usable_evidence_cards"] == agent_result["payload"][
+        "partially_verified_cards"
+    ]
     assert any("Tavily 검색 요약" in item for item in agent_result["limitations"])
 
 
@@ -297,6 +303,7 @@ def test_verifier_returns_insufficient_when_cards_are_empty() -> None:
     assert agent_result["evidence_ids"] == []
     assert agent_result["payload"]["all_verified_cards"] == []
     assert result["verified_evidence_cards"] == []
+    assert result["usable_evidence_cards"] == []
 
 
 def test_verifier_prompt_uses_required_yaml_format() -> None:

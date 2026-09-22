@@ -5,5 +5,6 @@ def test_global_state_is_importable() -> None:
     state: GlobalState = {
         "user_query": "Compare TurboQuant and CXL-based KV Cache",
         "verified_evidence_cards": [],
+        "usable_evidence_cards": [],
     }
     assert "user_query" in state

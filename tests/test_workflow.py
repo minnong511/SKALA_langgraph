@@ -29,4 +29,5 @@ def test_full_workflow_reaches_report_writer() -> None:
     # 입력에 근거 카드가 없으므로 실제 검증기는 근거 부족으로 종료한다.
     assert result["verification_result"]["status"] == "insufficient_evidence"
     assert result["verified_evidence_cards"] == []
+    assert result["usable_evidence_cards"] == []
     assert "final_report" in result

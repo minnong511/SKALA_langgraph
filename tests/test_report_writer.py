@@ -44,6 +44,7 @@ def state():
     for card in state["evidence_cards"]:
         card["verification_status"] = "verified"
     state["verified_evidence_cards"] = deepcopy(state["evidence_cards"])
+    state["usable_evidence_cards"] = deepcopy(state["evidence_cards"])
     state["verification_result"] = {"status": "ok"}
     state["user_query"] = "클라우드 비용과 지연 비교"
     state["synthesis_result"] = {
@@ -107,6 +108,19 @@ def test_outline_citations_and_input_preservation(state, monkeypatch):
     assert state["user_query"] in messages[1].content
 
 
+def test_redundant_inline_evidence_metadata_is_removed(state, monkeypatch):
+    """본문에 중복된 evidence_ids 메타데이터가 있어도 별도 필드 근거를 사용해 생성하는지 확인."""
+    reply = response(state)
+    paragraph = reply["sections"][0]["paragraphs"][0]
+    paragraph["text"] += " (evidence_ids: [technical-cxl_based-001])"
+    mock_llm(monkeypatch, reply)
+
+    report = module.report_writer_agent(state)["final_report"]
+
+    assert report.startswith("# SUMMARY")
+    assert "evidence_ids:" not in report
+
+
 def test_empty_evidence_no_api(monkeypatch):
     """근거가 없으면 LLM 없이 고정 목차의 판단 보류 안내를 만드는지 확인."""
     loader, _ = mock_llm(monkeypatch, {})
@@ -122,7 +136,7 @@ def test_empty_evidence_no_api(monkeypatch):
 
 
 @pytest.mark.parametrize(
-    "mode", ["unknown", "uncited", "missing", "duplicate", "heading"]
+    "mode", ["unknown", "uncited", "heading"]
 )
 def test_bad_generation_rejected(state, monkeypatch, mode):
     """잘못된 ID, 무인용 주장, 누락 절, 중복 절, 임의 제목의 다섯 오류 차단 확인."""
@@ -145,14 +159,51 @@ def test_bad_generation_rejected(state, monkeypatch, mode):
     )
 
 
+@pytest.mark.parametrize("mode", ["missing", "duplicate"])
+def test_section_shape_is_normalized(state, monkeypatch, mode):
+    """누락·중복 절은 판단 보류 또는 병합으로 보완한 뒤 보고서를 생성하는지 확인."""
+    reply = response(state)
+    if mode == "missing":
+        reply["sections"].pop()
+    else:
+        reply["sections"].append(deepcopy(reply["sections"][0]))
+    mock_llm(monkeypatch, reply)
+
+    report = module.report_writer_agent(state)["final_report"]
+
+    assert report.startswith("# SUMMARY")
+    assert "판단 보류" in report or mode == "duplicate"
+
+
 def test_unverified_reference_rejected_before_api(state, monkeypatch):
     """종합 결과가 미검증 카드를 인용하면 보고서 LLM 호출 전에 차단하는지 확인."""
     state["evidence_cards"][0]["verification_status"] = "unverified"
     state["verified_evidence_cards"][0]["verification_status"] = "unverified"
+    state["usable_evidence_cards"][0]["verification_status"] = "unverified"
     loader, _ = mock_llm(monkeypatch, {})
     # 결과 확인: 아래 assert 조건 중 하나라도 다르면 테스트 실패.
     assert "생성 실패" in module.report_writer_agent(state)["final_report"]
     loader.assert_not_called()
+
+
+def test_partial_cards_can_generate_provisional_report(state, monkeypatch):
+    """부분 검증 카드만 있어도 잠정 보고서를 생성하는지 확인."""
+    state["verification_result"] = {
+        "status": "insufficient_evidence",
+        "limitations": ["부분 검증 근거를 포함한 잠정 평가"],
+    }
+    state["synthesis_result"]["status"] = "insufficient_evidence"
+    for card in state["evidence_cards"]:
+        card["verification_status"] = "partially_verified"
+    state["verified_evidence_cards"] = []
+    state["usable_evidence_cards"] = deepcopy(state["evidence_cards"])
+
+    loader, _ = mock_llm(monkeypatch, response(state))
+    report = module.report_writer_agent(state)["final_report"]
+
+    assert report.startswith("# SUMMARY")
+    assert "부분 검증 근거" in report
+    loader.assert_called_once()
 
 
 def test_api_failure_keeps_string_and_redacts(state, monkeypatch):
@@ -165,6 +216,17 @@ def test_api_failure_keeps_string_and_redacts(state, monkeypatch):
     assert isinstance(result["final_report"], str)
     assert "생성 실패" in result["final_report"]
     assert "SECRET" not in result["final_report"]
+
+
+def test_report_failure_identifies_failing_node(state, monkeypatch):
+    """보고서 노드 오류가 발생하면 안전한 실패 문자열에 노드명이 포함되는지 확인."""
+    reply = response(state)
+    reply["sections"][0]["paragraphs"][0]["evidence_ids"] = ["invented"]
+    mock_llm(monkeypatch, reply)
+
+    result = module.report_writer_agent(state)
+
+    assert "validate_sections:ValueError:unknown_citation" in result["final_report"]
 
 
 def test_invalid_outline(state, monkeypatch, tmp_path):
