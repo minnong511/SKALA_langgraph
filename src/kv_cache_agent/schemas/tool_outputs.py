@@ -30,5 +30,5 @@ class FetchedSource(TypedDict, total=False):
     content_length: int
     status_code: int
     content_type: str
-    fetch_status: Literal["ok", "empty", "unsupported", "error"]
+    fetch_status: Literal["ok", "empty", "blocked", "unsupported", "error"]
     error: str

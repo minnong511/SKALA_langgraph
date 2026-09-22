@@ -2,6 +2,7 @@
 
 from io import BytesIO
 from pathlib import PurePosixPath
+from typing import Literal
 from urllib.parse import urlparse
 
 import httpx
@@ -13,6 +14,7 @@ from kv_cache_agent.schemas.tool_outputs import FetchedSource
 DEFAULT_TIMEOUT = 15.0
 DEFAULT_MAX_CHARS = 30_000
 USER_AGENT = "kv-cache-agent/0.1 source-fetcher"
+BLOCKED_STATUS_CODES = {401, 403, 451}
 
 
 def _error_result(
@@ -21,6 +23,7 @@ def _error_result(
     *,
     status_code: int = 0,
     content_type: str = "",
+    fetch_status: Literal["error", "blocked"] = "error",
 ) -> FetchedSource:
     """원문 수집 실패도 에이전트가 처리할 수 있는 결과로 표현한다."""
     return {
@@ -32,7 +35,7 @@ def _error_result(
         "content_length": 0,
         "status_code": status_code,
         "content_type": content_type,
-        "fetch_status": "error",
+        "fetch_status": fetch_status,
         "error": message,
     }
 
@@ -99,8 +102,16 @@ def fetch_source(
 
     try:
         response = http_client.get(clean_url)
-        response.raise_for_status()
         content_type = response.headers.get("content-type", "")
+        if response.status_code in BLOCKED_STATUS_CODES:
+            return _error_result(
+                clean_url,
+                f"원문 접근이 차단되었습니다: HTTP {response.status_code}",
+                status_code=response.status_code,
+                content_type=content_type,
+                fetch_status="blocked",
+            )
+        response.raise_for_status()
 
         if _is_pdf(content_type, clean_url):
             title, content = _extract_pdf(response, clean_url)
@@ -131,6 +142,18 @@ def fetch_source(
             "content_type": content_type,
             "fetch_status": "ok" if content else "empty",
         }
+    except httpx.HTTPStatusError as error:
+        error_response = error.response
+        return _error_result(
+            clean_url,
+            f"원문 수집에 실패했습니다: {error}",
+            status_code=error_response.status_code if error_response else 0,
+            content_type=(
+                error_response.headers.get("content-type", "")
+                if error_response
+                else ""
+            ),
+        )
     except (httpx.HTTPError, ValueError) as error:
         return _error_result(
             clean_url,

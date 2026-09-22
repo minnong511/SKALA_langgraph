@@ -1,5 +1,6 @@
 """Tavily 웹 검색과 검색 결과 정규화를 담당하는 도구."""
 
+from collections.abc import Sequence
 from typing import Any, Literal
 
 from tavily import TavilyClient
@@ -9,6 +10,11 @@ from kv_cache_agent.schemas.tool_outputs import WebSearchResult
 
 SearchTopic = Literal["general", "news", "finance"]
 SearchDepth = Literal["basic", "advanced", "fast", "ultra-fast"]
+DEFAULT_EXCLUDED_DOMAINS = (
+    "medium.com",
+    "towardsai.net",
+    "rocketreach.co",
+)
 
 
 class TavilySearchError(RuntimeError):
@@ -64,6 +70,7 @@ def search_web(
     search_depth: SearchDepth = "basic",
     topic: SearchTopic = "general",
     include_raw_content: bool = False,
+    exclude_domains: Sequence[str] | None = DEFAULT_EXCLUDED_DOMAINS,
     client: TavilyClient | None = None,
 ) -> list[WebSearchResult]:
     """Tavily에서 웹 검색을 수행하고 공통 결과 형식으로 반환한다.
@@ -85,14 +92,23 @@ def search_web(
             )
         search_client = TavilyClient(api_key=TAVILY_API_KEY)
 
+    clean_excluded_domains = [
+        domain.strip()
+        for domain in (exclude_domains or [])
+        if str(domain).strip()
+    ]
+    search_kwargs: dict[str, Any] = {
+        "query": clean_query,
+        "search_depth": search_depth,
+        "topic": topic,
+        "max_results": max_results,
+        "include_raw_content": include_raw_content,
+    }
+    if clean_excluded_domains:
+        search_kwargs["exclude_domains"] = clean_excluded_domains
+
     try:
-        response = search_client.search(
-            query=clean_query,
-            search_depth=search_depth,
-            topic=topic,
-            max_results=max_results,
-            include_raw_content=include_raw_content,
-        )
+        response = search_client.search(**search_kwargs)
     except Exception as error:
         raise TavilySearchError(f"Tavily 검색에 실패했습니다: {error}") from error
 

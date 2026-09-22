@@ -75,6 +75,22 @@ def _fake_source(card: dict[str, object]) -> dict[str, object]:
     }
 
 
+def _blocked_source(card: dict[str, object]) -> dict[str, object]:
+    """원문 서버가 403을 반환한 상황을 재현한다."""
+    return {
+        "title": str(card["source_title"]),
+        "url": str(card["source_url"]),
+        "content": "",
+        "source_type": "web",
+        "published_date": str(card["published_date"]),
+        "content_length": 0,
+        "status_code": 403,
+        "content_type": "text/html",
+        "fetch_status": "blocked",
+        "error": "원문 접근이 차단되었습니다: HTTP 403",
+    }
+
+
 def _full_support(
     cards: list[dict[str, object]],
     _sources: dict[str, dict[str, object]],
@@ -150,6 +166,32 @@ def test_verifier_returns_common_result_and_verified_cards(monkeypatch) -> None:
     )
     # 검증기는 GlobalState 입력 카드를 직접 변경하지 않는다.
     assert state["evidence_cards"] == original_cards
+
+
+def test_verifier_uses_tavily_excerpt_as_partial_fallback(monkeypatch) -> None:
+    """원문 차단 시 Tavily 요약을 사용하되 검증 완료로 승격하지 않는다."""
+    monkeypatch.setattr(verifier, "_fetch_original_source", _blocked_source)
+    monkeypatch.setattr(verifier, "_compare_claims_with_sources", _full_support)
+
+    result = evidence_verification_agent({"evidence_cards": _sample_cards()})
+    agent_result = result["verification_result"]
+
+    assert agent_result["status"] == "insufficient_evidence"
+    assert len(agent_result["payload"]["partially_verified_cards"]) == 2
+    assert agent_result["payload"]["verified_evidence_cards"] == []
+    assert agent_result["payload"]["tavily_fallback_ids"] == [
+        "cloud-domain-turboquant-001",
+        "cloud-domain-cxl_based-002",
+    ]
+    assert all(
+        card["verification_status"] == "partially_verified"
+        for card in agent_result["payload"]["partially_verified_cards"]
+    )
+    assert all(
+        "원문 접근 차단" in card["caveat"]
+        for card in agent_result["payload"]["partially_verified_cards"]
+    )
+    assert any("Tavily 검색 요약" in item for item in agent_result["limitations"])
 
 
 def test_verifier_rechecks_failed_card_once(monkeypatch) -> None:

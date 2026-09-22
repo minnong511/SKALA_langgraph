@@ -63,6 +63,7 @@ class VerificationGraphState(TypedDict, total=False):
     retry_possible: bool
     limitations: list[str]
     errors: list[str]
+    tavily_fallback_ids: list[str]
     verification_result: dict[str, Any]
 
 
@@ -312,7 +313,9 @@ def _recheck_original_sources_node(
     cards = state.get("cards", [])
     active_ids = set(state.get("active_evidence_ids", []))
     sources = dict(state.get("source_documents", {}))
+    limitations = list(state.get("limitations", []))
     errors = list(state.get("errors", []))
+    tavily_fallback_ids = list(state.get("tavily_fallback_ids", []))
     source_cache: dict[str, FetchedSource] = {}
 
     for index, card in enumerate(cards, start=1):
@@ -325,14 +328,36 @@ def _recheck_original_sources_node(
             source = _fetch_original_source(card)
             source_cache[source_url] = source
         sources[evidence_id] = source
-        if source.get("fetch_status") != "ok":
+        if source.get("fetch_status") == "blocked":
+            fallback_content = str(card.get("evidence_text", "")).strip()
+            if card.get("retrieval_method") == "tavily" and fallback_content:
+                # 원문 대신 Tavily 검색 요약만 사용하므로 부분 검증으로만 처리한다.
+                sources[evidence_id] = {
+                    **source,
+                    "content": fallback_content,
+                    "content_length": len(fallback_content),
+                    "content_type": "text/plain; source=tavily",
+                }
+                if evidence_id not in tavily_fallback_ids:
+                    tavily_fallback_ids.append(evidence_id)
+                limitations.append(
+                    f"{evidence_id}: 원문 접근 차단으로 Tavily 검색 요약만 사용했습니다."
+                )
+            else:
+                errors.append(
+                    f"{evidence_id} 원문 확인 실패: "
+                    f"{source.get('error', source.get('fetch_status', 'error'))}"
+                )
+        elif source.get("fetch_status") != "ok":
             errors.append(
                 f"{evidence_id} 원문 확인 실패: "
                 f"{source.get('error', source.get('fetch_status', 'error'))}"
             )
     return {
         "source_documents": sources,
+        "limitations": list(dict.fromkeys(limitations)),
         "errors": list(dict.fromkeys(errors)),
+        "tavily_fallback_ids": tavily_fallback_ids,
     }
 
 
@@ -348,7 +373,12 @@ def _compare_claim_and_evidence_node(
         and state.get("source_documents", {})
         .get(_card_id(card, index), {})
         .get("fetch_status")
-        == "ok"
+        in {"ok", "blocked"}
+        and bool(
+            state.get("source_documents", {})
+            .get(_card_id(card, index), {})
+            .get("content")
+        )
     ]
     decisions = dict(state.get("decisions", {}))
     errors = list(state.get("errors", []))
@@ -399,6 +429,7 @@ def _classify_fact_and_inference_node(
     metadata_issues = state.get("metadata_issues", {})
     decisions = state.get("decisions", {})
     quality_checks = state.get("quality_checks", {})
+    tavily_fallback_ids = set(state.get("tavily_fallback_ids", []))
 
     for index, original_card in enumerate(state.get("cards", []), start=1):
         evidence_id = _card_id(original_card, index)
@@ -411,6 +442,9 @@ def _classify_fact_and_inference_node(
         claim_type_assessment = decision.get("claim_type_assessment", "unclear")
         if issues or support_level == "none":
             verification_status = "unsupported"
+        elif evidence_id in tavily_fallback_ids:
+            # Tavily 검색 요약은 원문을 대체할 수 없으므로 검증 완료로 승격하지 않는다.
+            verification_status = "partially_verified"
         elif support_level == "partial" or claim_type_assessment != "correct":
             verification_status = "partially_verified"
         else:
@@ -430,6 +464,8 @@ def _classify_fact_and_inference_node(
         card["verification_status"] = verification_status
         rationale = str(decision.get("rationale", "")).strip()
         caveats = [str(card.get("caveat", "")).strip(), rationale, *issues]
+        if evidence_id in tavily_fallback_ids:
+            caveats.append("원문 접근 차단으로 Tavily 검색 요약만 확인함")
         card["caveat"] = " | ".join(item for item in caveats if item)
         verified_cards.append(card)
     return {"verified_cards": verified_cards}
@@ -595,6 +631,7 @@ def _return_verified_result_node(
             "balance_result": state.get("balance_result", {}),
             "retry_requests": state.get("retry_requests", []),
             "retry_count": state.get("retry_count", 0),
+            "tavily_fallback_ids": state.get("tavily_fallback_ids", []),
             "uncertain_evidence_ids": [
                 str(card.get("evidence_id", ""))
                 for card in [*partial, *unsupported]
@@ -672,6 +709,7 @@ def _empty_verification_result(summary: str) -> dict[str, Any]:
                 "balance_result": {},
                 "retry_requests": [],
                 "retry_count": 0,
+                "tavily_fallback_ids": [],
                 "uncertain_evidence_ids": [],
             },
         }
@@ -701,6 +739,7 @@ def evidence_verification_agent(state: GlobalState) -> dict[str, Any]:
             "retry_possible": False,
             "limitations": [],
             "errors": [],
+            "tavily_fallback_ids": [],
         }
     )
     return {"verification_result": graph_result["verification_result"]}

@@ -62,6 +62,11 @@ def test_search_web_normalizes_and_deduplicates_results():
     assert results[0]["source_type"] == "web"
     assert results[0]["retrieval_method"] == "tavily"
     assert client.last_kwargs["max_results"] == 5
+    assert client.last_kwargs["exclude_domains"] == [
+        "medium.com",
+        "towardsai.net",
+        "rocketreach.co",
+    ]
 
 
 def test_search_web_rejects_empty_query():
@@ -116,3 +121,20 @@ def test_fetch_source_returns_structured_error_for_invalid_url():
 
     assert result["fetch_status"] == "error"
     assert result["content"] == ""
+
+
+def test_fetch_source_marks_forbidden_as_blocked():
+    response = httpx.Response(
+        403,
+        headers={"content-type": "text/html"},
+        request=httpx.Request("GET", "https://example.com/blocked"),
+    )
+
+    result = fetch_source(
+        "https://example.com/blocked",
+        client=FakeHttpClient(response),
+    )
+
+    assert result["fetch_status"] == "blocked"
+    assert result["status_code"] == 403
+    assert "차단" in result["error"]
