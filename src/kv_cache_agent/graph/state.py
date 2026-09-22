@@ -1,5 +1,5 @@
 import operator
-from typing import Annotated, Any, Literal, TypedDict
+from typing import Annotated, Literal, TypedDict
 
 from kv_cache_agent.schemas.outputs import (
     AgentResult,
@@ -40,17 +40,3 @@ class GlobalState(TypedDict, total=False):
     synthesis_result: AgentResult
     final_report: str
 
-
-class TechnicalLocalState(TypedDict, total=False):
-    query: str
-    retrieved_chunks: list[dict[str, Any]]
-    evidence_cards: list[EvidenceCard]
-    retry_count: int
-
-
-class WebResearchLocalState(TypedDict, total=False):
-    search_queries: list[str]
-    tavily_results: list[dict[str, Any]]
-    fetched_documents: list[dict[str, Any]]
-    evidence_cards: list[EvidenceCard]
-    retry_count: int
