@@ -1,0 +1,98 @@
+{
+  "technical_result": {
+    "agent_name": "technical_research",
+    "status": "ok",
+    "summary": "TurboQuant는 벡터 양자화를 이용해 KV Cache를 저비트로 압축하는 소프트웨어 접근이고, CXL-based 접근은 CXL-hybrid memory와 계층형 prefetching으로 대용량 KV Cache를 원격 메모리 계층에 수용하는 하드웨어 접근이다.",
+    "evidence_ids": [
+      "technical-turboquant-001",
+      "technical-turboquant-002",
+      "technical-cxl_based-001",
+      "technical-cxl_based-002"
+    ],
+    "limitations": [
+      "이 샘플은 TurboQuant 논문과 CXL-hybrid memory 논문 2건만을 대상으로 작성했다.",
+      "실제 클라우드 운영 비용과 멀티테넌시 환경의 효과는 평가하지 않았다.",
+      "근거 카드는 후속 근거 검증 에이전트의 검증 대상이다."
+    ],
+    "errors": [],
+    "payload": {
+      "fixture": true,
+      "source_papers": 2,
+      "technologies": [
+        "TurboQuant",
+        "CXL-based"
+      ],
+      "notes": "FAISS 검색 결과와 논문 원문을 사람이 확인해 작성한 개발용 샘플 결과"
+    }
+  },
+  "evidence_cards": [
+    {
+      "evidence_id": "technical-turboquant-001",
+      "technology": "TurboQuant",
+      "perspective": "technical",
+      "claim": "TurboQuant는 랜덤 회전으로 입력 벡터의 좌표 분포를 정리한 뒤 MSE 양자화와 잔차에 대한 1-bit Quantized JL 변환을 결합하는 2단계 벡터 양자화 방식이다.",
+      "evidence_text": "논문 초록은 TurboQuant가 랜덤 회전과 좌표의 근사적 독립성을 활용해 스칼라 양자화를 적용하고, MSE 양자화 이후 잔차에 1-bit Quantized JL 변환을 적용한다고 설명한다.",
+      "source_title": "TurboQuant: Online Vector Quantization with Near-optimal Distortion Rate",
+      "source_url": "data/papers/turboquant.pdf",
+      "source_type": "paper",
+      "source_locator": "p. 1",
+      "retrieval_method": "faiss",
+      "published_date": "2025-04-28",
+      "claim_type": "fact",
+      "confidence": 0.95,
+      "caveat": "논문의 이론과 실험 설정에 기반한 기술 설명이다.",
+      "verification_status": "unverified"
+    },
+    {
+      "evidence_id": "technical-turboquant-002",
+      "technology": "TurboQuant",
+      "perspective": "technical",
+      "claim": "TurboQuant 논문은 KV Cache 양자화에서 3.5 bits per channel에서는 품질 저하가 없고, 2.5 bits per channel에서는 품질 저하가 작다고 보고한다.",
+      "evidence_text": "논문 초록은 KV Cache 양자화 실험에서 3.5 bits per channel로 절대적인 품질 중립성을 달성하고, 2.5 bits per channel에서는 미미한 품질 저하가 관찰되었다고 기술한다.",
+      "source_title": "TurboQuant: Online Vector Quantization with Near-optimal Distortion Rate",
+      "source_url": "data/papers/turboquant.pdf",
+      "source_type": "paper",
+      "source_locator": "p. 1",
+      "retrieval_method": "faiss",
+      "published_date": "2025-04-28",
+      "claim_type": "fact",
+      "confidence": 0.9,
+      "caveat": "품질 결과는 논문에서 사용한 모델과 평가 조건에 한정된다.",
+      "verification_status": "unverified"
+    },
+    {
+      "evidence_id": "technical-cxl_based-001",
+      "technology": "CXL-based",
+      "perspective": "technical",
+      "claim": "ITME는 CXL-hybrid memory를 이용해 GPU 서버에 TB 규모의 byte-addressable 원격 메모리 확장 계층을 제공하고, DMA 기반 다중 계층 prefetching으로 CXL 메모리에서 GPU 메모리로 데이터를 이동한다.",
+      "evidence_text": "ITME 논문 초록은 CXL-hybrid memory를 활용한 TB-scale byte-addressable remote memory expansion과 CXL-hybrid memory 장치에서 GPU 메모리까지의 pipelined, multi-tier DMA-based prefetching을 제안한다.",
+      "source_title": "ITME: Inference Tiered Memory Expansion with Disaggregated CXL-Hybrid Memories",
+      "source_url": "data/papers/cxl_based_kv_cache.pdf",
+      "source_type": "paper",
+      "source_locator": "p. 1",
+      "retrieval_method": "faiss",
+      "published_date": "",
+      "claim_type": "fact",
+      "confidence": 0.95,
+      "caveat": "논문에서 제안한 ITME 시스템의 설계와 평가 결과에 해당한다.",
+      "verification_status": "unverified"
+    },
+    {
+      "evidence_id": "technical-cxl_based-002",
+      "technology": "CXL-based",
+      "perspective": "technical",
+      "claim": "CXL-hybrid memory 기반 접근은 장문 컨텍스트 KV Cache와 같이 비교적 예측 가능한 대용량 데이터를 원격 계층에 배치하고 prefetching으로 접근 지연을 숨기는 전략을 사용한다.",
+      "evidence_text": "ITME 논문은 long-context KV Cache를 대용량 원격 확장 계층에 배치하고, 예측 가능한 접근 패턴을 이용해 저장장치·네트워크 지연을 HW/SW prefetching과 DMA 파이프라인으로 숨긴다고 설명한다.",
+      "source_title": "ITME: Inference Tiered Memory Expansion with Disaggregated CXL-Hybrid Memories",
+      "source_url": "data/papers/cxl_based_kv_cache.pdf",
+      "source_type": "paper",
+      "source_locator": "p. 2-3",
+      "retrieval_method": "faiss",
+      "published_date": "",
+      "claim_type": "fact",
+      "confidence": 0.9,
+      "caveat": "working KV Cache와 activations처럼 지연에 민감한 데이터는 고속 메모리 계층에 남기는 설계 가정이 있다.",
+      "verification_status": "unverified"
+    }
+  ]
+}

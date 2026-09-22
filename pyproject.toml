@@ -1,0 +1,42 @@
+[project]
+name = "kv-cache-sw-vs-hw"
+version = "0.1.0"
+description = "Supervisor-based Agentic RAG for multi-perspective KV Cache evaluation"
+readme = "README.md"
+requires-python = ">=3.11,<3.12"
+dependencies = [
+    "faiss-cpu>=1.9.0",
+    "huggingface-hub>=0.29.0",
+    "langchain-community>=0.3.0",
+    "langchain-core>=0.3.0",
+    "langchain-huggingface>=0.1.0",
+    "langchain-openai>=0.3.0",
+    "langchain-text-splitters>=0.3.0",
+    "langgraph>=0.3.0",
+    "pydantic>=2.0.0",
+    "pypdf>=5.0.0",
+    "python-dotenv>=1.0.0",
+    "pyyaml>=6.0.0",
+    "sentence-transformers>=3.0.0",
+    "tavily-python>=0.5.0",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0.0",
+    "ruff>=0.9.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/kv_cache_agent"]
+
+[tool.ruff]
+line-length = 88
+target-version = "py311"
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
