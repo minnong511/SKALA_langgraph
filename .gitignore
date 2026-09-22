@@ -13,6 +13,8 @@ outputs/runs/*
 !outputs/runs/.gitkeep
 outputs/reports/*
 !outputs/reports/.gitkeep
+outputs/logs/*
+!outputs/logs/.gitkeep
 
 .DS_Store
 
