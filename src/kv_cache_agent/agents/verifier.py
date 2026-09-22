@@ -720,7 +720,10 @@ def evidence_verification_agent(state: GlobalState) -> dict[str, Any]:
     """A 입력을 받아 검증 LangGraph를 실행하고 L 결과를 GlobalState에 반환한다."""
     cards = [deepcopy(card) for card in state.get("evidence_cards", [])]
     if not cards:
-        return _empty_verification_result("검증할 근거 카드가 없습니다.")
+        return {
+            **_empty_verification_result("검증할 근거 카드가 없습니다."),
+            "verified_evidence_cards": [],
+        }
 
     graph_result = EVIDENCE_VERIFICATION_GRAPH.invoke(
         {
@@ -742,4 +745,11 @@ def evidence_verification_agent(state: GlobalState) -> dict[str, Any]:
             "tavily_fallback_ids": [],
         }
     )
-    return {"verification_result": graph_result["verification_result"]}
+    verification_result = graph_result["verification_result"]
+    verified_cards = verification_result["payload"].get(
+        "verified_evidence_cards", []
+    )
+    return {
+        "verification_result": verification_result,
+        "verified_evidence_cards": deepcopy(verified_cards),
+    }

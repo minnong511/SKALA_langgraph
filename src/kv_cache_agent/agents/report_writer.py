@@ -33,7 +33,7 @@
     입력 필드:
         user_query: str
         synthesis_result, verification_result: AgentResult
-        evidence_cards: list[EvidenceCard]
+        evidence_cards, verified_evidence_cards: list[EvidenceCard]
         research_plan: ResearchPlan  # 선택 입력
     반환 구조: {"final_report": str}
     정상 문자열 구조: SUMMARY → 본문 6개 장과 하위 절 20개 → REFERENCE.

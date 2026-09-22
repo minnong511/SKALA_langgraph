@@ -35,8 +35,9 @@ class GlobalState(TypedDict, total=False):
 
     # 병렬로 실행되는 평가 에이전트가 이 필드에 근거 카드를 추가한다.
     evidence_cards: Annotated[list[EvidenceCard], operator.add]
+    # 검증기가 확정한 카드만 별도 필드로 전달하여 종합 단계의 입력으로 사용한다.
+    verified_evidence_cards: list[EvidenceCard]
 
     verification_result: AgentResult
     synthesis_result: AgentResult
     final_report: str
-

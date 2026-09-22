@@ -157,6 +157,9 @@ def test_verifier_returns_common_result_and_verified_cards(monkeypatch) -> None:
     assert agent_result["status"] == "ok"
     assert len(agent_result["evidence_ids"]) == 2
     assert len(agent_result["payload"]["verified_evidence_cards"]) == 2
+    assert result["verified_evidence_cards"] == agent_result["payload"][
+        "verified_evidence_cards"
+    ]
     assert agent_result["payload"]["partially_verified_cards"] == []
     assert agent_result["payload"]["unsupported_cards"] == []
     assert agent_result["payload"]["retry_count"] == 0
@@ -293,6 +296,7 @@ def test_verifier_returns_insufficient_when_cards_are_empty() -> None:
     assert agent_result["status"] == "insufficient_evidence"
     assert agent_result["evidence_ids"] == []
     assert agent_result["payload"]["all_verified_cards"] == []
+    assert result["verified_evidence_cards"] == []
 
 
 def test_verifier_prompt_uses_required_yaml_format() -> None:

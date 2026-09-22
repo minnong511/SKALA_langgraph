@@ -8,7 +8,8 @@
 
 인풋:
     GlobalState의 user_query, technical_result, market_result,
-    stakeholder_result, cloud_domain_result, verification_result, evidence_cards.
+    stakeholder_result, cloud_domain_result, verification_result,
+    evidence_cards, verified_evidence_cards.
     작성 지침은 prompts/synthesis.yaml에서 로드.
 함수 기능:
     synthesis_agent: 내부 LangGraph 호출 후 기존 반환 형식으로 결과 전달.
@@ -31,7 +32,7 @@
         user_query: str
         technical_result, market_result, stakeholder_result,
         cloud_domain_result, verification_result: AgentResult
-        evidence_cards: list[EvidenceCard]
+        evidence_cards, verified_evidence_cards: list[EvidenceCard]
     GlobalState와 AgentResult는 TypedDict(total=False)로 정의된 딕셔너리.
     아래는 타입 설명용 표기이며 실제 값은 해당 자료형의 데이터로 전달.
 
@@ -124,9 +125,9 @@ def _load_config(path: Path) -> dict[str, Any]:
 
 
 def _verified_cards(state: GlobalState) -> tuple[dict[str, dict], list[str]]:
-    """카드의 명시적 판정만 사용. 검증 노드의 ok로 카드를 승격하지 않음."""
+    """GlobalState의 검증 완료 카드만 종합 입력으로 선별한다."""
     cards: dict[str, dict] = {}
-    for card in state.get("evidence_cards", []):
+    for card in state.get("verified_evidence_cards", []):
         key = card.get("evidence_id")
         if not isinstance(key, str) or not key.strip():
             raise ValueError("Missing evidence ID")

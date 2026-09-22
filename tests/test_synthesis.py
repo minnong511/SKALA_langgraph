@@ -50,6 +50,7 @@ def verified(state):
     state = deepcopy(state)
     for card in state["evidence_cards"]:
         card["verification_status"] = "verified"
+    state["verified_evidence_cards"] = deepcopy(state["evidence_cards"])
     return state
 
 
@@ -112,6 +113,24 @@ def test_technical_only_preserves_limits_and_query(state, monkeypatch):
     assert state == before
 
 
+def test_synthesis_consumes_explicit_global_verified_cards(state, monkeypatch):
+    """원본 카드가 미검증이어도 GlobalState의 검증 카드만 종합에 사용하는지 확인."""
+    verified_cards = deepcopy(state["evidence_cards"])
+    for card in verified_cards:
+        card["verification_status"] = "verified"
+    state["verified_evidence_cards"] = verified_cards
+
+    loader, _ = install_llm(monkeypatch, draft(state))
+    output = module.synthesis_agent(state)["synthesis_result"]
+
+    assert output["evidence_ids"]
+    loader.assert_called_once()
+    assert all(
+        card["verification_status"] == "unverified"
+        for card in state["evidence_cards"]
+    )
+
+
 def test_four_perspectives_success(state, monkeypatch):
     """네 관점 모두에 두 기술의 모의 근거가 있을 때 ok 반환 확인."""
     state = verified(state)
@@ -125,6 +144,7 @@ def test_four_perspectives_success(state, monkeypatch):
                 source_url="https://example.test",
             )
             state["evidence_cards"].append(card)
+            state["verified_evidence_cards"].append(deepcopy(card))
     response = draft(state)
     response["comparison_rows"] = [
         {
@@ -171,6 +191,7 @@ def test_conflicting_duplicate_fails(state, monkeypatch):
     other = deepcopy(state["evidence_cards"][0])
     other["claim"] = "충돌하는 내용"
     state["evidence_cards"].append(other)
+    state["verified_evidence_cards"].append(deepcopy(other))
     loader, _ = install_llm(monkeypatch, {})
     # 결과 확인: 아래 assert 조건 중 하나라도 다르면 테스트 실패.
     assert module.synthesis_agent(state)["synthesis_result"]["status"] == "failed"

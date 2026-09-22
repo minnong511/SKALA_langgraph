@@ -13,7 +13,8 @@ from kv_cache_agent.schemas.tool_outputs import FetchedSource
 
 DEFAULT_TIMEOUT = 15.0
 DEFAULT_MAX_CHARS = 30_000
-USER_AGENT = "kv-cache-agent/0.1 source-fetcher"
+USER_AGENT = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/153.0.0.0 Safari/537.36"
+# USER_AGENT = "kv-cache-agent/0.1 source-fetcher"
 BLOCKED_STATUS_CODES = {401, 403, 451}
 
 

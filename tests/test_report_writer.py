@@ -43,6 +43,7 @@ def state():
     )
     for card in state["evidence_cards"]:
         card["verification_status"] = "verified"
+    state["verified_evidence_cards"] = deepcopy(state["evidence_cards"])
     state["verification_result"] = {"status": "ok"}
     state["user_query"] = "클라우드 비용과 지연 비교"
     state["synthesis_result"] = {
@@ -147,6 +148,7 @@ def test_bad_generation_rejected(state, monkeypatch, mode):
 def test_unverified_reference_rejected_before_api(state, monkeypatch):
     """종합 결과가 미검증 카드를 인용하면 보고서 LLM 호출 전에 차단하는지 확인."""
     state["evidence_cards"][0]["verification_status"] = "unverified"
+    state["verified_evidence_cards"][0]["verification_status"] = "unverified"
     loader, _ = mock_llm(monkeypatch, {})
     # 결과 확인: 아래 assert 조건 중 하나라도 다르면 테스트 실패.
     assert "생성 실패" in module.report_writer_agent(state)["final_report"]
