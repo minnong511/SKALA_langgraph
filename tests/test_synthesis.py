@@ -218,3 +218,62 @@ def test_missing_verification_prevents_llm(state, monkeypatch):
         == "insufficient_evidence"
     )
     loader.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("mode", "expected"),
+    [
+        (
+            "success",
+            ["load_config", "prepare_context", "generate", "validate", "build_result"],
+        ),
+        ("empty", ["load_config", "prepare_context", "insufficient"]),
+        (
+            "bad_citation",
+            ["load_config", "prepare_context", "generate", "validate", "failure"],
+        ),
+        ("api_error", ["load_config", "prepare_context", "generate", "failure"]),
+        ("bad_config", ["load_config", "failure"]),
+    ],
+)
+def test_synthesis_graph_routes(state, monkeypatch, tmp_path, mode, expected):
+    """실제 stream 이벤트로 정상, 자료 부족, 생성 오류, 검증 오류 경로 확인."""
+    request = state if mode == "empty" else verified(state)
+    before = deepcopy(request)
+    reply = draft(request)
+    if mode == "bad_citation":
+        reply["summary"][0]["evidence_ids"] = ["missing"]
+    loader, llm = install_llm(monkeypatch, reply)
+    if mode == "api_error":
+        llm.with_structured_output.return_value.invoke.side_effect = RuntimeError(
+            "SECRET"
+        )
+    if mode == "bad_config":
+        path = tmp_path / "invalid.yaml"
+        path.write_text("system_prompt: [")
+        monkeypatch.setattr(module, "PROMPT_PATH", path)
+    events = list(
+        module.build_synthesis_graph().stream(
+            {"request": request}, stream_mode="updates"
+        )
+    )
+    assert [name for event in events for name in event] == expected
+    output = events[-1][expected[-1]]["output"]
+    assert set(output) == {"synthesis_result"}
+    assert "SECRET" not in str(events)
+    assert request == before
+    if mode in ("empty", "bad_config"):
+        loader.assert_not_called()
+    else:
+        llm.with_structured_output.return_value.invoke.assert_called_once()
+
+
+def test_synthesis_cached_graph_keeps_runs_separate(state, monkeypatch):
+    """동일한 컴파일 그래프를 재사용해도 이전 카드와 오류가 다음 실행에 남지 않는지 확인."""
+    request = verified(state)
+    _, llm = install_llm(monkeypatch, draft(request))
+    first = module.synthesis_agent(request)
+    assert first["synthesis_result"]["evidence_ids"]
+    second = module.synthesis_agent(state)
+    assert second["synthesis_result"]["evidence_ids"] == []
+    llm.with_structured_output.return_value.invoke.assert_called_once()

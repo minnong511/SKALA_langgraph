@@ -1,3 +1,10 @@
+# 내부 LangGraph: 순차 처리와 조건부 분기로 구성, 반복 루프 없음.
+# 정상: START → load_config → prepare_context → generate → validate_sections
+#       → render → validate_report → END
+# 자료 부족: prepare_context → fallback → validate_report → END (LLM 호출 생략)
+# 처리 오류 또는 종합 실패: 해당 노드 → failure → END
+# 외부 반환: {"final_report": str}, 내부 상태: ReportState
+
 """보고서 생성 에이전트: 종합 결과의 문서화와 출처 연결.
 
 인풋:
@@ -6,7 +13,9 @@
     목차와 절별 지침은 prompts/report_writer.yaml에서 로드.
 
 함수 기능:
-    report_writer_agent: 입력 확인 → LLM 본문 작성 → 인용 검사 → 문서 조립.
+    report_writer_agent: 내부 LangGraph 호출 후 기존 문자열 형식으로 결과 전달.
+    build_report_graph: 설정 → 입력 → 생성 → 인용 검사 → 조립 → 최종 검사 연결.
+    조건부 경로: 자료 부족은 fallback, 처리 오류는 failure 노드로 이동.
     _load_prompt_config: 최상위 목차 8개와 하위 절 20개의 구조 검사.
     _render_markdown: 고정 제목, 인용 번호, 실제 사용한 참고문헌 조립.
     _fallback: 검증 자료 부족 시 외부 호출 없이 안내 보고서 구성.
@@ -15,7 +24,7 @@
     {"final_report": str} 형태의 Markdown 문자열 갱신값.
     생성 실패 시에도 같은 문자열 형식으로 안전한 실패 안내 반환.
     관점별 원본 평가의 재평가, 신규 검색, PDF 생성과 파일 저장 없음.
-    
+
 검증 범위:
     SUMMARY의 PDF 반 페이지 조건은 별도 PDF 렌더링 단계에서 확인 필요.
 
@@ -54,14 +63,19 @@ LLM 내부 응답 형식:
 
 import json
 import re
+from copy import deepcopy
+from functools import lru_cache
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, TypedDict
 
 from langchain_core.messages import HumanMessage, SystemMessage
+from langgraph.graph import END, START, StateGraph
 from pydantic import BaseModel, ConfigDict, Field
 
 from kv_cache_agent.agents.synthesis import (
+    _guard_node,
     _load_config,
+    _route_error,
     _validate_numbers,
     _verified_cards,
 )
@@ -83,6 +97,7 @@ TITLES = [
 
 class Paragraph(BaseModel):
     """사실, 추론, 한계와 관련 근거 ID를 담는 본문 문단."""
+
     model_config = ConfigDict(extra="forbid")
     text: str = Field(min_length=1)
     claim_type: Literal["fact", "inference", "limitation"]
@@ -91,6 +106,7 @@ class Paragraph(BaseModel):
 
 class Section(BaseModel):
     """YAML의 절 ID에 대응하는 생성 문단 목록."""
+
     model_config = ConfigDict(extra="forbid")
     section_id: str
     paragraphs: list[Paragraph] = Field(min_length=1)
@@ -98,6 +114,7 @@ class Section(BaseModel):
 
 class ReportDraft(BaseModel):
     """SUMMARY와 하위 절의 생성 응답 검사용 내부 모델."""
+
     model_config = ConfigDict(extra="forbid")
     sections: list[Section]
 
@@ -204,81 +221,195 @@ def _fallback(config: dict, reason: str, limitations: list[str]) -> str:
     return _render_markdown(config, sections, {})
 
 
-def report_writer_agent(state: GlobalState) -> dict[str, Any]:
-    """종합 결과만 문서화. 관점별 원본 요약의 재평가와 신규 검색 없음."""
-    try:
-        config = _load_prompt_config()
-        result = state.get("synthesis_result", {})
-        if result.get("status") == "failed":
-            return {"final_report": "# 보고서 생성 실패\n평가 종합 실패로 작성 중단\n"}
-        if result.get("status") not in ("ok", "insufficient_evidence"):
-            return {"final_report": _fallback(config, "평가 종합 결과 미확보", [])}
-        allowed, limitations = _verified_cards(state)
-        ids = result.get("evidence_ids", [])
-        if not isinstance(ids, list) or not set(ids) <= allowed.keys():
-            raise ValueError("Invalid synthesis evidence IDs")
-        cards = {key: allowed[key] for key in ids}
-        if not cards:
-            return {
-                "final_report": _fallback(
-                    config,
-                    "검증 완료 근거 부족으로 판단 보류",
-                    [*limitations, *result.get("limitations", [])],
-                )
-            }
-        outline = _body_sections(config)
-        context = {
-            "user_query": state.get("user_query", ""),
-            "synthesis_result": result,
-            "evidence_cards": list(cards.values()),
-            "verification_result": state.get("verification_result", {}),
-            "research_plan": state.get("research_plan", {}),
-            "report_structure": config["report_structure"],
-            "reference_formats": config.get("reference_formats", {}),
-            "summary_layout_target": config.get("summary_layout_target", {}),
+class ReportState(TypedDict, total=False):
+    """보고서 서브그래프 전용 상태. final_report 외의 내부 값은 외부 반환 금지."""
+
+    request: GlobalState
+    config: dict[str, Any]
+    result: dict[str, Any]
+    cards: dict[str, dict]
+    limitations: list[str]
+    fallback_reason: str
+    upstream_failed: bool
+    response: Any
+    sections: dict[str, list[Paragraph]]
+    markdown: str
+    error_type: str
+    output: dict[str, str]
+
+
+@_guard_node
+def _load_report_config(local: ReportState) -> dict:
+    """입력: 내부 상태 → 처리: YAML과 목차 검사 → 출력: config."""
+    return {"config": _load_prompt_config()}
+
+
+@_guard_node
+def _prepare_report_context(local: ReportState) -> dict:
+    """입력: request → 처리: 종합 상태와 허용 근거 확인 → 출력: 생성 또는 안내 자료."""
+    state = local["request"]
+    result = state.get("synthesis_result", {})
+    if result.get("status") == "failed":
+        return {"upstream_failed": True}
+    if result.get("status") not in ("ok", "insufficient_evidence"):
+        return {"fallback_reason": "평가 종합 결과 미확보", "limitations": []}
+    allowed, limitations = _verified_cards(state)
+    ids = result.get("evidence_ids", [])
+    if not isinstance(ids, list) or not set(ids) <= allowed.keys():
+        raise ValueError("Invalid synthesis evidence IDs")
+    cards = {key: allowed[key] for key in ids}
+    if not cards:
+        return {
+            "fallback_reason": "검증 완료 근거 부족으로 판단 보류",
+            "limitations": [*limitations, *result.get("limitations", [])],
         }
-        response = (
-            get_llm()
-            .with_structured_output(ReportDraft)
-            .invoke(
-                [
-                    SystemMessage(content=config["system_prompt"]),
-                    HumanMessage(content=json.dumps(context, ensure_ascii=False)),
-                ]
+    return {"cards": cards, "result": result}
+
+
+def _route_report_input(local: ReportState) -> str:
+    """오류와 상류 실패는 failure, 자료 부족은 fallback, 정상 입력은 generate로 이동."""
+    if local.get("error_type") or local.get("upstream_failed"):
+        return "error"
+    return "fallback" if local.get("fallback_reason") else "ready"
+
+
+@_guard_node
+def _generate_sections(local: ReportState) -> dict:
+    """입력: 종합과 근거, YAML → 처리: LLM 1회 호출 → 출력: response."""
+    state, cards, config = local["request"], local["cards"], local["config"]
+    result = local["result"]
+    context = {
+        "user_query": state.get("user_query", ""),
+        "synthesis_result": result,
+        "evidence_cards": list(cards.values()),
+        "verification_result": state.get("verification_result", {}),
+        "research_plan": state.get("research_plan", {}),
+        "report_structure": config["report_structure"],
+        "reference_formats": config.get("reference_formats", {}),
+        "summary_layout_target": config.get("summary_layout_target", {}),
+    }
+    response = (
+        get_llm()
+        .with_structured_output(ReportDraft)
+        .invoke(
+            [
+                SystemMessage(content=config["system_prompt"]),
+                HumanMessage(content=json.dumps(context, ensure_ascii=False)),
+            ]
+        )
+    )
+    return {"response": response}
+
+
+@_guard_node
+def _validate_sections(local: ReportState) -> dict:
+    """입력: response → 처리: 절 ID, 인용, 수치 검사 → 출력: sections."""
+    response, cards = local["response"], local["cards"]
+    result = local["result"]
+    outline = _body_sections(local["config"])
+    draft = ReportDraft.model_validate(response)
+    expected = [s["id"] for s in outline]
+    actual = [s.section_id for s in draft.sections]
+    if len(actual) != len(set(actual)) or set(actual) != set(expected):
+        raise ValueError("Missing or duplicate section")
+    for section in draft.sections:
+        for paragraph in section.paragraphs:
+            if not set(paragraph.evidence_ids) <= cards.keys():
+                raise ValueError("Unknown citation")
+            if paragraph.claim_type != "limitation" and not paragraph.evidence_ids:
+                raise ValueError("Uncited assertion")
+            if paragraph.claim_type != "limitation":
+                _validate_numbers(paragraph.text, paragraph.evidence_ids, cards)
+            if not paragraph.text.strip() or re.search(
+                r"\[[^]]+\]|^\s*#", paragraph.text
+            ):
+                raise ValueError("Inline citation or heading is not permitted")
+    sections = {s.section_id: s.paragraphs for s in draft.sections}
+    # 상류에서 확인한 자료 부족은 LLM의 누락 여부와 무관하게 보고서에 보존.
+    if result.get("limitations"):
+        sections["section_6_1"].append(
+            Paragraph(
+                text=" / ".join(result["limitations"]),
+                claim_type="limitation",
+                evidence_ids=[],
             )
         )
-        draft = ReportDraft.model_validate(response)
-        expected = [s["id"] for s in outline]
-        actual = [s.section_id for s in draft.sections]
-        if len(actual) != len(set(actual)) or set(actual) != set(expected):
-            raise ValueError("Missing or duplicate section")
-        for section in draft.sections:
-            for paragraph in section.paragraphs:
-                if not set(paragraph.evidence_ids) <= cards.keys():
-                    raise ValueError("Unknown citation")
-                if paragraph.claim_type != "limitation" and not paragraph.evidence_ids:
-                    raise ValueError("Uncited assertion")
-                if paragraph.claim_type != "limitation":
-                    _validate_numbers(paragraph.text, paragraph.evidence_ids, cards)
-                if not paragraph.text.strip() or re.search(
-                    r"\[[^]]+\]|^\s*#", paragraph.text
-                ):
-                    raise ValueError("Inline citation or heading is not permitted")
-        sections = {s.section_id: s.paragraphs for s in draft.sections}
-        # 상류에서 확인한 자료 부족은 LLM의 누락 여부와 무관하게 보고서에 보존.
-        if result.get("limitations"):
-            sections["section_6_1"].append(
-                Paragraph(
-                    text=" / ".join(result["limitations"]),
-                    claim_type="limitation",
-                    evidence_ids=[],
-                )
-            )
-        markdown = _render_markdown(config, sections, cards)
-        if re.findall(r"^# (.+)$", markdown, re.MULTILINE) != TITLES:
-            raise ValueError("Rendered outline mismatch")
-        return {"final_report": markdown}
-    except Exception as error:  # noqa: BLE001 - 노드 경계에서 실패 결과로 변환
-        return {
-            "final_report": f"# 보고서 생성 실패\n보고서 처리 오류 ({type(error).__name__})\n"
-        }
+    return {"sections": sections}
+
+
+@_guard_node
+def _render_report(local: ReportState) -> dict:
+    """입력: 검사된 절과 근거 → 처리: 제목과 참고문헌 조립 → 출력: markdown."""
+    return {
+        "markdown": _render_markdown(local["config"], local["sections"], local["cards"])
+    }
+
+
+@_guard_node
+def _validate_report(local: ReportState) -> dict:
+    """입력: markdown → 처리: 최종 제목 순서 검사 → 출력: 기존 final_report 형식."""
+    markdown = local["markdown"]
+    if re.findall(r"^# (.+)$", markdown, re.MULTILINE) != TITLES:
+        raise ValueError("Rendered outline mismatch")
+    return {"output": {"final_report": markdown}}
+
+
+@_guard_node
+def _build_fallback_report(local: ReportState) -> dict:
+    """자료 부족 안내도 지정 목차로 구성한 뒤 최종 검사 노드로 전달."""
+    return {
+        "markdown": _fallback(
+            local["config"], local["fallback_reason"], local["limitations"]
+        )
+    }
+
+
+def _report_failure(local: ReportState) -> dict:
+    """오류 경로에서도 문자열 계약 유지. 예외 메시지와 내부 상태 노출 금지."""
+    if local.get("upstream_failed"):
+        reason = "평가 종합 실패로 작성 중단"
+    else:
+        reason = f"보고서 처리 오류 ({local['error_type']})"
+    return {"output": {"final_report": f"# 보고서 생성 실패\n{reason}\n"}}
+
+
+@lru_cache(maxsize=1)
+def build_report_graph():
+    """생성, 인용 검사, 렌더링, 최종 검사를 분리한 LangGraph 구성."""
+    graph = StateGraph(ReportState)
+    graph.add_node("load_config", _load_report_config)
+    graph.add_node("prepare_context", _prepare_report_context)
+    graph.add_node("generate", _generate_sections)
+    graph.add_node("validate_sections", _validate_sections)
+    graph.add_node("render", _render_report)
+    graph.add_node("validate_report", _validate_report)
+    graph.add_node("fallback", _build_fallback_report)
+    graph.add_node("failure", _report_failure)
+    graph.add_edge(START, "load_config")
+    graph.add_conditional_edges(
+        "prepare_context",
+        _route_report_input,
+        {"ready": "generate", "fallback": "fallback", "error": "failure"},
+    )
+    for source, target in (
+        ("load_config", "prepare_context"),
+        ("generate", "validate_sections"),
+        ("validate_sections", "render"),
+        ("render", "validate_report"),
+        ("fallback", "validate_report"),
+        ("validate_report", END),
+    ):
+        graph.add_conditional_edges(
+            source, _route_error, {"next": target, "error": "failure"}
+        )
+    graph.add_edge("failure", END)
+    return graph.compile()
+
+
+def report_writer_agent(state: GlobalState) -> dict[str, Any]:
+    """GlobalState를 내부 그래프에 전달하고 final_report 문자열만 반환."""
+    try:
+        result = build_report_graph().invoke({"request": deepcopy(state)})
+        return result["output"]
+    except Exception as error:  # noqa: BLE001 - 그래프 실행 경계의 오류 처리
+        return _report_failure({"error_type": type(error).__name__})["output"]

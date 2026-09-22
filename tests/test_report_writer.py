@@ -214,3 +214,86 @@ def test_synthesis_to_report_with_mocked_llms(state, monkeypatch):
     assert report.startswith("# SUMMARY")
     assert "다른 관점의 자료 부족" in report
     assert key in report
+
+
+@pytest.mark.parametrize(
+    ("mode", "expected"),
+    [
+        (
+            "success",
+            [
+                "load_config",
+                "prepare_context",
+                "generate",
+                "validate_sections",
+                "render",
+                "validate_report",
+            ],
+        ),
+        ("empty", ["load_config", "prepare_context", "fallback", "validate_report"]),
+        ("upstream_failed", ["load_config", "prepare_context", "failure"]),
+        (
+            "bad_citation",
+            [
+                "load_config",
+                "prepare_context",
+                "generate",
+                "validate_sections",
+                "failure",
+            ],
+        ),
+        ("api_error", ["load_config", "prepare_context", "generate", "failure"]),
+        (
+            "render_error",
+            [
+                "load_config",
+                "prepare_context",
+                "generate",
+                "validate_sections",
+                "render",
+                "failure",
+            ],
+        ),
+    ],
+)
+def test_report_graph_routes(state, monkeypatch, mode, expected):
+    """생성과 렌더링의 실제 노드 실행 및 오류 시 후속 노드 미실행 확인."""
+    reply = response(state)
+    if mode == "bad_citation":
+        reply["sections"][0]["paragraphs"][0]["evidence_ids"] = ["missing"]
+    loader, llm = mock_llm(monkeypatch, reply)
+    if mode == "empty":
+        state["synthesis_result"]["evidence_ids"] = []
+    if mode == "upstream_failed":
+        state["synthesis_result"]["status"] = "failed"
+    if mode == "api_error":
+        llm.with_structured_output.return_value.invoke.side_effect = RuntimeError(
+            "SECRET"
+        )
+    if mode == "render_error":
+        monkeypatch.setattr(
+            module, "_render_markdown", Mock(side_effect=RuntimeError("SECRET"))
+        )
+    before = deepcopy(state)
+    events = list(
+        module.build_report_graph().stream({"request": state}, stream_mode="updates")
+    )
+    assert [name for event in events for name in event] == expected
+    output = events[-1][expected[-1]]["output"]
+    assert set(output) == {"final_report"}
+    assert isinstance(output["final_report"], str)
+    assert "SECRET" not in str(events)
+    assert state == before
+    if mode in ("empty", "upstream_failed"):
+        loader.assert_not_called()
+    else:
+        llm.with_structured_output.return_value.invoke.assert_called_once()
+
+
+def test_report_cached_graph_recovers_after_error(state, monkeypatch):
+    """이전 실행의 실패 상태가 재사용 그래프의 다음 정상 실행에 영향을 주지 않는지 확인."""
+    _, llm = mock_llm(monkeypatch, response(state))
+    llm.with_structured_output.return_value.invoke.side_effect = RuntimeError("SECRET")
+    assert "생성 실패" in module.report_writer_agent(state)["final_report"]
+    llm.with_structured_output.return_value.invoke.side_effect = None
+    assert module.report_writer_agent(state)["final_report"].startswith("# SUMMARY")
