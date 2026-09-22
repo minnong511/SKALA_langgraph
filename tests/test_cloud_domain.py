@@ -6,6 +6,7 @@ import yaml
 from kv_cache_agent.agents import cloud_domain
 from kv_cache_agent.agents.cloud_domain import (
     CLOUD_EVALUATION_CRITERIA,
+    CloudComparison,
     CloudDomainExtraction,
     CloudDomainFinding,
     cloud_domain_agent,
@@ -114,10 +115,11 @@ def _extraction_for(
         )
     return CloudDomainExtraction(
         summary="두 기술의 주요 클라우드 시나리오를 같은 기준으로 평가했다.",
-        comparison={
-            "TurboQuant": "소프트웨어 기반 KV Cache 압축",
-            "CXL-based": "하드웨어 기반 원격 메모리 확장",
-        },
+        comparison=CloudComparison(
+            turboquant="소프트웨어 기반 KV Cache 압축",
+            cxl_based="하드웨어 기반 원격 메모리 확장",
+            trade_off="메모리 절감과 용량 확장의 차이가 있다.",
+        ),
         findings=findings,
         limitations=[],
     )

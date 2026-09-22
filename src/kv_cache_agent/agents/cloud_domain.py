@@ -111,11 +111,19 @@ class CloudDomainFinding(BaseModel):
     caveat: str = ""
 
 
+class CloudComparison(BaseModel):
+    """두 기술의 클라우드 적용성 비교를 고정된 형식으로 제한한다."""
+
+    turboquant: str
+    cxl_based: str
+    trade_off: str
+
+
 class CloudDomainExtraction(BaseModel):
     """LLM의 전체 클라우드 평가 결과를 검증 가능한 형태로 제한한다."""
 
     summary: str
-    comparison: dict[str, Any] = Field(default_factory=dict)
+    comparison: CloudComparison
     findings: list[CloudDomainFinding] = Field(default_factory=list)
     limitations: list[str] = Field(default_factory=list)
 
@@ -136,7 +144,7 @@ class CloudDomainGraphState(TypedDict, total=False):
     related_source_count: int
     evidence_cards: list[EvidenceCard]
     findings: list[CloudDomainFinding]
-    comparison: dict[str, Any]
+    comparison: dict[str, str]
     summary: str
     missing_coverage: list[tuple[str, str]]
     limitations: list[str]
@@ -726,7 +734,7 @@ def _evaluate_domain_fit_node(
     )
     findings = [*state.get("findings", []), *extraction.findings]
     comparison = dict(state.get("comparison", {}))
-    comparison.update(extraction.comparison)
+    comparison.update(extraction.comparison.model_dump())
     limitations = [*state.get("limitations", []), *extraction.limitations]
     if skipped_findings:
         limitations.append(
