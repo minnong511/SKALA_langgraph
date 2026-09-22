@@ -1,0 +1,17 @@
+.env
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+
+data/vector_db/*
+!data/vector_db/.gitkeep
+data/cache/*
+!data/cache/.gitkeep
+outputs/runs/*
+!outputs/runs/.gitkeep
+outputs/reports/*
+!outputs/reports/.gitkeep
+
+.DS_Store
