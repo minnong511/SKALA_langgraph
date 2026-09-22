@@ -103,43 +103,88 @@ def test_outline_citations_and_input_preservation(state, monkeypatch):
     assert "technical-turboquant-001" not in refs
     assert "발행일 미상" in refs and "p. 1" in refs
     assert "시장 정보 부족" in text
+    assert text.index("시장 정보 부족") > text.index("## 6.4")
+    assert text.index(module.ANALYTICAL_METHOD_NOTE) > text.index("## 6.4")
     assert state == before
     messages = llm.with_structured_output.return_value.invoke.call_args.args[0]
     assert state["user_query"] in messages[1].content
+
+
+def test_report_writer_uses_all_usable_cards(state, monkeypatch):
+    """종합 핵심 카드에 없는 허용 카드도 보고서 작성에 사용할 수 있는지 확인."""
+    state["synthesis_result"]["evidence_ids"] = [
+        state["evidence_cards"][0]["evidence_id"]
+    ]
+    reply = response(state)
+    mock_llm(monkeypatch, reply)
+
+    report = module.report_writer_agent(state)["final_report"]
+
+    assert report.startswith("# SUMMARY")
+    messages = module.get_llm.return_value.with_structured_output.return_value.invoke
+    context = messages.call_args.args[0][1].content
+    assert state["evidence_cards"][2]["evidence_id"] in context
 
 
 def test_redundant_inline_evidence_metadata_is_removed(state, monkeypatch):
     """본문에 중복된 evidence_ids 메타데이터가 있어도 별도 필드 근거를 사용해 생성하는지 확인."""
     reply = response(state)
     paragraph = reply["sections"][0]["paragraphs"][0]
-    paragraph["text"] += " (evidence_ids: [technical-cxl_based-001])"
+    paragraph["text"] = (
+        "추론: "
+        + paragraph["text"]
+        + " (evidence_ids: [technical-cxl_based-001])"
+    )
     mock_llm(monkeypatch, reply)
 
     report = module.report_writer_agent(state)["final_report"]
 
     assert report.startswith("# SUMMARY")
     assert "evidence_ids:" not in report
+    assert "추론:" not in report
 
 
-def test_empty_evidence_no_api(monkeypatch):
-    """근거가 없으면 LLM 없이 고정 목차의 판단 보류 안내를 만드는지 확인."""
-    loader, _ = mock_llm(monkeypatch, {})
+def test_empty_evidence_generates_detailed_analysis(monkeypatch):
+    """근거가 없어도 LLM을 실행하고 모든 절을 내용으로 채우는지 확인."""
+    reply = {
+        "sections": [
+            {
+                "section_id": section["id"],
+                "paragraphs": [
+                    {
+                        "text": "직접 근거는 부족하지만 기술 특성상 가능성이 있다.",
+                        "claim_type": "inference",
+                        "evidence_ids": [],
+                    }
+                ],
+            }
+            for section in module._body_sections(module._load_prompt_config())
+        ]
+    }
+    loader, _ = mock_llm(monkeypatch, reply)
     output = module.report_writer_agent(
         {"synthesis_result": {"status": "insufficient_evidence", "evidence_ids": []}}
     )
     # 결과 확인: 아래 assert 조건 중 하나라도 다르면 테스트 실패.
-    assert "판단 보류" in output["final_report"]
+    assert "추론:" not in output["final_report"]
+    assert output["final_report"].count(module.ANALYTICAL_METHOD_NOTE) == 1
+    assert "검증 가능한 근거가 부족하여 이 항목의 판단을 보류한다." not in output[
+        "final_report"
+    ]
     assert (
         re.findall(r"^# (.+)$", output["final_report"], re.MULTILINE) == module.TITLES
     )
-    loader.assert_not_called()
+    loader.assert_called_once()
+    context = loader.return_value.with_structured_output.return_value.invoke.call_args.args[
+        0
+    ][1].content
+    assert '"inference_detail_mode": true' in context
+    assert "기술 원리에서 출발해 작동 메커니즘을 설명한다." in context
 
 
-@pytest.mark.parametrize(
-    "mode", ["unknown", "uncited", "heading"]
-)
+@pytest.mark.parametrize("mode", ["heading"])
 def test_bad_generation_rejected(state, monkeypatch, mode):
-    """잘못된 ID, 무인용 주장, 누락 절, 중복 절, 임의 제목의 다섯 오류 차단 확인."""
+    """보고서 구조 자체가 잘못된 경우에만 생성을 중단하는지 확인."""
     reply = response(state)
     paragraph = reply["sections"][0]["paragraphs"][0]
     if mode == "unknown":
@@ -161,7 +206,7 @@ def test_bad_generation_rejected(state, monkeypatch, mode):
 
 @pytest.mark.parametrize("mode", ["missing", "duplicate"])
 def test_section_shape_is_normalized(state, monkeypatch, mode):
-    """누락·중복 절은 판단 보류 또는 병합으로 보완한 뒤 보고서를 생성하는지 확인."""
+    """누락 절은 추론으로, 중복 절은 병합으로 보완한 뒤 보고서를 생성하는지 확인."""
     reply = response(state)
     if mode == "missing":
         reply["sections"].pop()
@@ -172,7 +217,26 @@ def test_section_shape_is_normalized(state, monkeypatch, mode):
     report = module.report_writer_agent(state)["final_report"]
 
     assert report.startswith("# SUMMARY")
-    assert "판단 보류" in report or mode == "duplicate"
+    if mode == "missing":
+        assert "남은 미확인 사항은 실제 클라우드 워크로드에서의 품질 변화" in report
+        assert report.count(module.ANALYTICAL_METHOD_NOTE) == 1
+    else:
+        assert "조건에 한정한 기술 해석" in report
+
+
+def test_uncited_fact_is_downgraded_to_inference(state, monkeypatch):
+    """자료 부족 상태의 무인용 fact를 사실로 통과시키지 않고 추론으로 낮추는지 확인."""
+    reply = response(state)
+    paragraph = reply["sections"][0]["paragraphs"][0]
+    paragraph["claim_type"] = "fact"
+    paragraph["evidence_ids"] = []
+    mock_llm(monkeypatch, reply)
+
+    report = module.report_writer_agent(state)["final_report"]
+
+    assert report.startswith("# SUMMARY")
+    assert "추론:" not in report
+    assert module.ANALYTICAL_METHOD_NOTE in report
 
 
 def test_unverified_reference_rejected_before_api(state, monkeypatch):
@@ -218,15 +282,16 @@ def test_api_failure_keeps_string_and_redacts(state, monkeypatch):
     assert "SECRET" not in result["final_report"]
 
 
-def test_report_failure_identifies_failing_node(state, monkeypatch):
-    """보고서 노드 오류가 발생하면 안전한 실패 문자열에 노드명이 포함되는지 확인."""
+def test_unknown_citation_is_downgraded_to_inference(state, monkeypatch):
+    """잘못된 인용 ID가 있어도 해당 문장을 추론으로 바꿔 보고서를 생성하는지 확인."""
     reply = response(state)
     reply["sections"][0]["paragraphs"][0]["evidence_ids"] = ["invented"]
     mock_llm(monkeypatch, reply)
 
     result = module.report_writer_agent(state)
 
-    assert "validate_sections:ValueError:unknown_citation" in result["final_report"]
+    assert result["final_report"].startswith("# SUMMARY")
+    assert "추론:" not in result["final_report"]
 
 
 def test_invalid_outline(state, monkeypatch, tmp_path):
@@ -241,12 +306,15 @@ def test_invalid_outline(state, monkeypatch, tmp_path):
 
 
 def test_fabricated_number_rejected(state, monkeypatch):
-    """근거에 없는 98765라는 숫자를 생성한 응답의 차단 확인."""
+    """근거에 없는 숫자도 추론 문장으로 보고서에 포함하는지 확인."""
     reply = response(state)
     reply["sections"][0]["paragraphs"][0]["text"] = "처리량 98765% 증가"
     mock_llm(monkeypatch, reply)
     # 결과 확인: 아래 assert 조건 중 하나라도 다르면 테스트 실패.
-    assert "생성 실패" in module.report_writer_agent(state)["final_report"]
+    report = module.report_writer_agent(state)["final_report"]
+    assert report.startswith("# SUMMARY")
+    assert "처리량 98765% 증가" in report
+    assert "추론:" not in report
 
 
 def test_synthesis_to_report_with_mocked_llms(state, monkeypatch):
@@ -294,8 +362,28 @@ def test_synthesis_to_report_with_mocked_llms(state, monkeypatch):
                 "validate_report",
             ],
         ),
-        ("empty", ["load_config", "prepare_context", "fallback", "validate_report"]),
-        ("upstream_failed", ["load_config", "prepare_context", "failure"]),
+        (
+            "empty",
+            [
+                "load_config",
+                "prepare_context",
+                "generate",
+                "validate_sections",
+                "render",
+                "validate_report",
+            ],
+        ),
+        (
+            "upstream_failed",
+            [
+                "load_config",
+                "prepare_context",
+                "generate",
+                "validate_sections",
+                "render",
+                "validate_report",
+            ],
+        ),
         (
             "bad_citation",
             [
@@ -303,7 +391,8 @@ def test_synthesis_to_report_with_mocked_llms(state, monkeypatch):
                 "prepare_context",
                 "generate",
                 "validate_sections",
-                "failure",
+                "render",
+                "validate_report",
             ],
         ),
         ("api_error", ["load_config", "prepare_context", "generate", "failure"]),
@@ -325,7 +414,7 @@ def test_report_graph_routes(state, monkeypatch, mode, expected):
     reply = response(state)
     if mode == "bad_citation":
         reply["sections"][0]["paragraphs"][0]["evidence_ids"] = ["missing"]
-    loader, llm = mock_llm(monkeypatch, reply)
+    _loader, llm = mock_llm(monkeypatch, reply)
     if mode == "empty":
         state["synthesis_result"]["evidence_ids"] = []
     if mode == "upstream_failed":
@@ -348,10 +437,7 @@ def test_report_graph_routes(state, monkeypatch, mode, expected):
     assert isinstance(output["final_report"], str)
     assert "SECRET" not in str(events)
     assert state == before
-    if mode in ("empty", "upstream_failed"):
-        loader.assert_not_called()
-    else:
-        llm.with_structured_output.return_value.invoke.assert_called_once()
+    llm.with_structured_output.return_value.invoke.assert_called_once()
 
 
 def test_report_cached_graph_recovers_after_error(state, monkeypatch):

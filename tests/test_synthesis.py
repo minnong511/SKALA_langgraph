@@ -154,7 +154,7 @@ def test_synthesis_uses_partial_cards_as_provisional_evidence(state, monkeypatch
 
 
 def test_synthesis_rejects_partial_card_as_fact(state, monkeypatch):
-    """부분 검증 카드를 사실 문장으로 사용하면 종합을 실패시킨다."""
+    """부분 검증 카드를 사실 문장으로 사용해도 잠정 종합으로 전환한다."""
     partial_cards = deepcopy(state["evidence_cards"])
     for card in partial_cards:
         card["verification_status"] = "partially_verified"
@@ -166,12 +166,12 @@ def test_synthesis_rejects_partial_card_as_fact(state, monkeypatch):
 
     output = module.synthesis_agent(state)["synthesis_result"]
 
-    assert output["status"] == "failed"
+    assert output["status"] == "insufficient_evidence"
     assert output["payload"]["diagnostics"][0]["check"] == "partial_card_fact"
 
 
 def test_synthesis_failure_identifies_failing_node(state, monkeypatch):
-    """종합 노드 오류가 발생하면 안전한 실패 결과에 노드명이 포함되는지 확인."""
+    """종합 검증 오류를 보고서 작성 가능한 잠정 결과로 전환하는지 확인."""
     verified_state = verified(state)
     response = draft(verified_state)
     response["summary"][0]["evidence_ids"] = ["invented"]
@@ -179,13 +179,36 @@ def test_synthesis_failure_identifies_failing_node(state, monkeypatch):
 
     output = module.synthesis_agent(verified_state)["synthesis_result"]
 
-    assert output["status"] == "failed"
-    assert "_validate_synthesis:ValueError:unknown_evidence_id" in output[
-        "errors"
-    ][0]
+    assert output["status"] == "insufficient_evidence"
+    assert output["errors"][0].startswith("종합 검증 경고")
     assert output["payload"]["diagnostics"][0]["evidence_statuses"] == {
         "invented": "missing"
     }
+
+
+def test_perspective_mismatch_does_not_retry(state, monkeypatch):
+    """관점이 섞여도 재시도하지 않고 잠정 종합으로 바로 반환하는지 확인."""
+    state = verified(state)
+    cross_perspective = deepcopy(state["evidence_cards"][0])
+    cross_perspective.update(
+        evidence_id="cloud-domain-cross-001",
+        perspective="cloud_domain",
+    )
+    state["evidence_cards"].append(cross_perspective)
+    state["verified_evidence_cards"].append(deepcopy(cross_perspective))
+    state["usable_evidence_cards"].append(deepcopy(cross_perspective))
+
+    invalid = draft(state)
+    invalid["comparison_rows"][0]["evidence_ids"] = [
+        cross_perspective["evidence_id"]
+    ]
+    loader, llm = install_llm(monkeypatch, invalid)
+
+    output = module.synthesis_agent(state)["synthesis_result"]
+
+    assert output["status"] == "insufficient_evidence"
+    assert loader.call_count == 1
+    assert llm.with_structured_output.return_value.invoke.call_count == 1
 
 
 def test_synthesis_accepts_partial_card_as_limitation(state, monkeypatch):
@@ -253,13 +276,16 @@ def test_excluded_cards(state, monkeypatch, status):
 
 
 def test_unknown_citation_rejected(state, monkeypatch):
-    """존재하지 않는 근거 ID를 반환한 LLM 응답의 실패 처리 확인."""
+    """존재하지 않는 근거 ID를 반환해도 잠정 종합으로 전환하는지 확인."""
     state = verified(state)
     response = draft(state)
     response["summary"][0]["evidence_ids"] = ["invented"]
     install_llm(monkeypatch, response)
     # 결과 확인: 아래 assert 조건 중 하나라도 다르면 테스트 실패.
-    assert module.synthesis_agent(state)["synthesis_result"]["status"] == "failed"
+    assert (
+        module.synthesis_agent(state)["synthesis_result"]["status"]
+        == "insufficient_evidence"
+    )
 
 
 def test_conflicting_duplicate_fails(state, monkeypatch):
@@ -297,15 +323,32 @@ def test_invalid_yaml(state, monkeypatch, tmp_path):
 
 
 def test_fabricated_number_rejected(state, monkeypatch):
-    """근거에 없는 98765라는 숫자를 생성한 응답의 차단 확인."""
+    """근거에 없는 숫자도 잠정 종합으로 전환해 보고서로 넘기는지 확인."""
     state = verified(state)
     reply = draft(state)
     reply["summary"][0]["text"] = "처리량이 98765% 증가"
     install_llm(monkeypatch, reply)
     # 결과 확인: 아래 assert 조건 중 하나라도 다르면 테스트 실패.
     output = module.synthesis_agent(state)["synthesis_result"]
-    assert output["status"] == "failed"
+    assert output["status"] == "insufficient_evidence"
     assert output["payload"]["diagnostics"][0]["check"] == "fabricated_number"
+
+
+def test_numeric_fraction_matches_number_word(state):
+    """근거의 one-sixth와 생성 결과의 1/6을 동일한 수치로 인식하는지 확인."""
+    cards = {
+        "fraction-card": {
+            "claim": "TurboQuant compresses memory to one-sixth of its original level.",
+            "evidence_text": "The memory footprint is one-sixth of the original level.",
+            "caveat": "The result depends on the evaluation setup.",
+        }
+    }
+
+    module._validate_numbers(
+        "TurboQuant compresses memory to 1/6 of its original level.",
+        ["fraction-card"],
+        cards,
+    )
 
 
 def test_missing_verification_prevents_llm(state, monkeypatch):
@@ -331,7 +374,13 @@ def test_missing_verification_prevents_llm(state, monkeypatch):
         ("empty", ["load_config", "prepare_context", "insufficient"]),
         (
             "bad_citation",
-            ["load_config", "prepare_context", "generate", "validate", "failure"],
+            [
+                "load_config",
+                "prepare_context",
+                "generate",
+                "validate",
+                "insufficient_after_validation",
+            ],
         ),
         ("api_error", ["load_config", "prepare_context", "generate", "failure"]),
         ("bad_config", ["load_config", "failure"]),

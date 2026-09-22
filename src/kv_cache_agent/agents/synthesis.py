@@ -14,7 +14,7 @@
 함수 기능:
     synthesis_agent: 내부 LangGraph 호출 후 기존 반환 형식으로 결과 전달.
     build_synthesis_graph: 설정 → 선별 → 생성 → 검증 → 결과 조립 노드 연결.
-    조건부 경로: 근거 부족은 insufficient, 처리 오류는 failure 노드로 이동.
+    조건부 경로: 종합 검증 오류는 재시도하지 않고 잠정 종합으로 전환.
     _verified_cards: verified 또는 partially_verified 카드를 선별.
     _validate_statement / _validate_numbers: 근거 ID와 숫자의 출처 존재 확인.
     _result: 기존 AgentResult 필드에 결과, 한계, 오류 구성.
@@ -82,6 +82,41 @@ from kv_cache_agent.llm import get_llm
 
 PROMPT_PATH = Path(__file__).resolve().parents[1] / "prompts" / "synthesis.yaml"
 PERSPECTIVES = ("technical", "market", "stakeholder", "cloud_domain")
+_NUMBER_WORDS = {
+    "zero": "0",
+    "one": "1",
+    "two": "2",
+    "three": "3",
+    "four": "4",
+    "five": "5",
+    "six": "6",
+    "seven": "7",
+    "eight": "8",
+    "nine": "9",
+    "ten": "10",
+}
+_FRACTION_DENOMINATORS = {
+    "half": 2,
+    "third": 3,
+    "fourth": 4,
+    "fifth": 5,
+    "sixth": 6,
+    "seventh": 7,
+    "eighth": 8,
+    "ninth": 9,
+    "tenth": 10,
+}
+_FRACTION_PATTERN = re.compile(
+    r"\b(?P<numerator>zero|one|two|three|four|five|six|seven|eight|nine|ten)"
+    r"[-\s](?P<denominator>half|third|fourth|fifth|sixth|seventh|eighth|ninth|tenth)\b",
+    re.IGNORECASE,
+)
+_NUMBER_WORD_PATTERN = re.compile(
+    r"\b(?:" + "|".join(_NUMBER_WORDS) + r")\b", re.IGNORECASE
+)
+_NUMERIC_PATTERN = re.compile(
+    r"(?<![\w.])\d+(?:[.,]\d+)*(?:/\d+(?:[.,]\d+)*)?"
+)
 
 
 class Statement(BaseModel):
@@ -175,14 +210,28 @@ def _validate_statement(statement: Statement, cards: dict[str, dict]) -> None:
 
 
 def _validate_numbers(text: str, ids: list[str], cards: dict[str, dict]) -> None:
-    """새 숫자 생성을 차단. 같은 숫자의 의미와 실험 조건까지 입증하지는 않음."""
-    pattern = r"(?<!\d)\d+(?:[.,]\d+)*"
+    """표기만 다른 동일 숫자를 정규화한 뒤 새로운 숫자 생성을 차단한다."""
     source = " ".join(
         str(cards[key].get(field, ""))
         for key in ids
         for field in ("claim", "evidence_text", "caveat")
     )
-    if not set(re.findall(pattern, text)) <= set(re.findall(pattern, source)):
+
+    def normalize_fraction(match: re.Match[str]) -> str:
+        numerator = _NUMBER_WORDS[match.group("numerator").lower()]
+        denominator = _FRACTION_DENOMINATORS[match.group("denominator").lower()]
+        return f"{numerator}/{denominator}"
+
+    def normalize_number_word(match: re.Match[str]) -> str:
+        return _NUMBER_WORDS[match.group(0).lower()]
+
+    def numeric_tokens(value: str) -> set[str]:
+        normalized = value.lower().replace("‑", "-").replace("–", "-")
+        normalized = _FRACTION_PATTERN.sub(normalize_fraction, normalized)
+        normalized = _NUMBER_WORD_PATTERN.sub(normalize_number_word, normalized)
+        return set(_NUMERIC_PATTERN.findall(normalized))
+
+    if not numeric_tokens(text) <= numeric_tokens(source):
         raise ValueError("Numeric claim absent from cited evidence")
 
 
@@ -228,27 +277,6 @@ def _statement_diagnostic(
             for evidence_id in evidence_ids
         },
         "text_preview": statement.text[:200],
-    }
-
-
-def _perspective_diagnostic(
-    row_index: int, row: Comparison, cards: dict[str, dict]
-) -> dict[str, Any]:
-    """비교 관점과 카드 관점 불일치 정보를 기록한다."""
-    return {
-        "node": "_validate_synthesis",
-        "check": "perspective_mismatch",
-        "statement_group": "comparison_rows",
-        "statement_index": row_index,
-        "perspective": row.perspective,
-        "evidence_ids": list(row.evidence_ids),
-        "evidence_perspectives": {
-            evidence_id: cards.get(evidence_id, {}).get(
-                "perspective", "missing"
-            )
-            for evidence_id in row.evidence_ids
-        },
-        "text_preview": row.text[:200],
     }
 
 
@@ -345,33 +373,54 @@ def _route_evidence(state: SynthesisState) -> str:
     return "ready" if state["cards"] else "empty"
 
 
-@_guard_node
-def _generate_synthesis(local: SynthesisState) -> dict:
-    """입력: request, cards, config → 처리: LLM 1회 호출 → 출력: response."""
-    state, cards, config = local["request"], local["cards"], local["config"]
-    context = {
+def _synthesis_context(local: SynthesisState) -> dict[str, Any]:
+    """내부 상태에서 관점별 근거를 분리한 LLM 입력을 구성한다."""
+    state, cards = local["request"], local["cards"]
+    return {
         "user_query": state.get("user_query", ""),
         "evidence_cards": list(cards.values()),
+        "evidence_cards_by_perspective": {
+            perspective: [
+                card
+                for card in cards.values()
+                if card.get("perspective") == perspective
+            ]
+            for perspective in PERSPECTIVES
+        },
         "perspective_results": {
-            p: {
-                "status": state.get(f"{p}_result", {}).get("status"),
-                "summary": state.get(f"{p}_result", {}).get("summary", ""),
+            perspective: {
+                "status": state.get(f"{perspective}_result", {}).get("status"),
+                "summary": state.get(f"{perspective}_result", {}).get("summary", ""),
                 "evidence_ids": [
                     key
-                    for key in state.get(f"{p}_result", {}).get("evidence_ids", [])
+                    for key in state.get(f"{perspective}_result", {}).get(
+                        "evidence_ids", []
+                    )
                     if key in cards
                 ],
             }
-            for p in PERSPECTIVES
+            for perspective in PERSPECTIVES
             if any(
                 key in cards
-                for key in state.get(f"{p}_result", {}).get("evidence_ids", [])
+                for key in state.get(f"{perspective}_result", {}).get(
+                    "evidence_ids", []
+                )
             )
         },
         "perspective_limitations": {
-            p: state.get(f"{p}_result", {}).get("limitations", []) for p in PERSPECTIVES
+            perspective: state.get(f"{perspective}_result", {}).get(
+                "limitations", []
+            )
+            for perspective in PERSPECTIVES
         },
     }
+
+
+@_guard_node
+def _generate_synthesis(local: SynthesisState) -> dict:
+    """입력: request, cards, config → 처리: LLM 1회 호출 → 출력: response."""
+    config = local["config"]
+    context = _synthesis_context(local)
     response = (
         get_llm()
         .with_structured_output(SynthesisDraft)
@@ -416,16 +465,6 @@ def _validate_synthesis(local: SynthesisState) -> dict:
                     ],
                 }
             statements.append(statement)
-    for row_index, row in enumerate(draft.comparison_rows):
-        if any(
-            cards[i].get("perspective") != row.perspective for i in row.evidence_ids
-        ):
-            return {
-                "error_type": "_validate_synthesis:ValueError:perspective_mismatch",
-                "diagnostics": [
-                    _perspective_diagnostic(row_index, row, cards)
-                ],
-            }
     covered = {row.perspective for row in draft.comparison_rows}
     for p in PERSPECTIVES:
         if p not in covered:
@@ -467,6 +506,32 @@ def _build_result(local: SynthesisState) -> dict:
     }
 
 
+def _route_validation(state: SynthesisState) -> str:
+    """종합 검증 오류는 재시도하지 않고 잠정 보고서 경로로 보낸다."""
+    if not state.get("error_type"):
+        return "next"
+    if state["error_type"].startswith("_validate_synthesis:"):
+        return "insufficient"
+    return "error"
+
+
+def _insufficient_after_validation(local: SynthesisState) -> dict:
+    """종합 검증 오류를 잠정 종합으로 전환해 Report Writer로 전달한다."""
+    limitations = [
+        "종합 결과의 일부 근거 연결 또는 수치 표현이 완전하지 않아 잠정 평가로 전환했습니다.",
+        "보고서는 확보된 자료와 기술적 추론을 함께 사용해 작성합니다.",
+    ]
+    return {
+        "output": _result(
+            "insufficient_evidence",
+            "검증 오류를 포함한 잠정 평가",
+            limitations=limitations,
+            errors=[f"종합 검증 경고 ({local.get('error_type', 'unknown')})"],
+            payload={"diagnostics": local.get("diagnostics", [])},
+        )
+    }
+
+
 def _insufficient_result(local: SynthesisState) -> dict:
     """근거가 없는 경로의 종료 결과. LLM 호출 없음."""
     return {
@@ -501,6 +566,7 @@ def build_synthesis_graph():
     graph.add_node("validate", _validate_synthesis)
     graph.add_node("build_result", _build_result)
     graph.add_node("insufficient", _insufficient_result)
+    graph.add_node("insufficient_after_validation", _insufficient_after_validation)
     graph.add_node("failure", _synthesis_failure)
     graph.add_edge(START, "load_config")
     graph.add_conditional_edges(
@@ -511,14 +577,23 @@ def build_synthesis_graph():
         _route_evidence,
         {"ready": "generate", "empty": "insufficient", "error": "failure"},
     )
-    for source, target in (
-        ("generate", "validate"),
-        ("validate", "build_result"),
-        ("build_result", END),
-    ):
-        graph.add_conditional_edges(
-            source, _route_error, {"next": target, "error": "failure"}
-        )
+    graph.add_conditional_edges(
+        "generate", _route_error, {"next": "validate", "error": "failure"}
+    )
+    graph.add_conditional_edges(
+        "validate",
+        _route_validation,
+        {
+            "next": "build_result",
+            "insufficient": "insufficient_after_validation",
+            "error": "failure",
+        },
+    )
+    graph.add_conditional_edges(
+        "build_result", _route_error, {"next": END, "error": "failure"}
+    )
+    # 검증 오류를 보존한 채 잠정 결과를 만들므로 오류 라우터를 다시 통과시키지 않는다.
+    graph.add_edge("insufficient_after_validation", END)
     graph.add_edge("insufficient", END)
     graph.add_edge("failure", END)
     return graph.compile()

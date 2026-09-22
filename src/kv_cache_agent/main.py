@@ -6,6 +6,7 @@ from pathlib import Path
 
 from kv_cache_agent.config import OUTPUTS_DIR
 from kv_cache_agent.graph.workflow import build_workflow
+from kv_cache_agent.tools.pdf_writer import write_pdf
 
 DEFAULT_QUERY = (
     "클라우드 LLM 서빙에서 TurboQuant와 CXL-based KV Cache 최적화 기술을 "
@@ -59,6 +60,15 @@ def main() -> None:
 
     report_path = output_dir / f"kv_cache_evaluation_{timestamp}.md"
     report_path.write_text(result["final_report"], encoding="utf-8")
+    pdf_path = output_dir / f"kv_cache_evaluation_{timestamp}.pdf"
+    pdf_error = None
+    try:
+        write_pdf(result["final_report"], pdf_path)
+    except Exception as error:  # noqa: BLE001 - Markdown 저장은 유지하고 PDF 오류를 로그화
+        pdf_error = {
+            "error_type": type(error).__name__,
+            "error": str(error),
+        }
 
     log_path.write_text(
         json.dumps(
@@ -66,6 +76,9 @@ def main() -> None:
                 "query": query,
                 "status": "completed",
                 "report_path": str(report_path),
+                "pdf_path": str(pdf_path) if pdf_error is None else None,
+                "pdf_status": "ok" if pdf_error is None else "failed",
+                "pdf_error": pdf_error,
                 "verification_status": result.get("verification_result", {}).get(
                     "status"
                 ),
@@ -92,6 +105,10 @@ def main() -> None:
 
     print(f"질문: {query}")
     print(f"보고서 저장 완료: {report_path}")
+    if pdf_error is None:
+        print(f"PDF 저장 완료: {pdf_path}")
+    else:
+        print(f"PDF 저장 실패: {pdf_error['error_type']} - {pdf_error['error']}")
     print(f"상세 실행 로그 저장: {log_path}")
     print("검증 상태:", result.get("verification_result", {}).get("status"))
     print("종합 상태:", result.get("synthesis_result", {}).get("status"))
