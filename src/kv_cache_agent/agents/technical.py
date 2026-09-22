@@ -1,7 +1,7 @@
 """논문 FAISS 검색 결과를 기술 근거로 변환하는 에이전트."""
 
 from pathlib import Path
-from typing import Any
+from typing import Any, TypedDict
 
 import yaml
 from langchain_core.messages import HumanMessage, SystemMessage
@@ -9,6 +9,7 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from kv_cache_agent.config import OPENAI_API_KEY
 from kv_cache_agent.graph.state import GlobalState
 from kv_cache_agent.llm import get_llm
+from kv_cache_agent.schemas.outputs import EvidenceCard
 from kv_cache_agent.schemas.technical import TechnicalExtraction
 from kv_cache_agent.tools.paper_retriever import retrieve_paper_chunks
 
@@ -22,6 +23,23 @@ DEFAULT_TECHNICAL_QUERIES = [
     "performance benefits and limitations of CXL-based KV Cache",
     "hardware and software requirements for both approaches",
 ]
+
+
+class TechnicalLocalState(TypedDict, total=False):
+    """기술 조사 에이전트 내부 그래프에서만 사용하는 상태."""
+
+    user_query: str
+    technologies: list[str]
+    queries: list[str]
+    retrieved_chunks: list[dict[str, Any]]
+    source_evidence: list[dict[str, Any]]
+    extraction: TechnicalExtraction
+    evidence_cards: list[EvidenceCard]
+    missing_items: list[str]
+    retry_count: int
+    max_retries: int
+    status: str
+    errors: list[str]
 
 
 def _load_system_prompt() -> str:
