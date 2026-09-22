@@ -1,10 +1,11 @@
 """TurboQuant와 CXL-based KV Cache의 클라우드 적용성을 평가하는 에이전트."""
 
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, TypedDict
 
 import yaml
 from langchain_core.messages import HumanMessage, SystemMessage
+from langgraph.graph import END, START, StateGraph
 from pydantic import BaseModel, Field
 
 from kv_cache_agent.graph.state import GlobalState
@@ -117,6 +118,32 @@ class CloudDomainExtraction(BaseModel):
     comparison: dict[str, Any] = Field(default_factory=dict)
     findings: list[CloudDomainFinding] = Field(default_factory=list)
     limitations: list[str] = Field(default_factory=list)
+
+
+class CloudDomainGraphState(TypedDict, total=False):
+    """클라우드 도메인 전용 LangGraph 노드 사이에서만 사용하는 LocalState."""
+
+    global_state: GlobalState
+    technical_cards: list[EvidenceCard]
+    scenarios: list[dict[str, str]]
+    initial_queries: list[str]
+    active_queries: list[str]
+    retry_queries: list[str]
+    retry_count: int
+    retry_possible: bool
+    web_results: list[WebSearchResult]
+    vector_chunks: list[dict[str, Any]]
+    related_source_count: int
+    evidence_cards: list[EvidenceCard]
+    findings: list[CloudDomainFinding]
+    comparison: dict[str, Any]
+    summary: str
+    missing_coverage: list[tuple[str, str]]
+    limitations: list[str]
+    errors: list[str]
+    skipped_findings: list[str]
+    fatal_error: str
+    cloud_domain_result: dict[str, Any]
 
 
 def _load_system_prompt() -> str:
@@ -583,149 +610,205 @@ def _empty_result(
     }
 
 
-def cloud_domain_agent(state: GlobalState) -> dict[str, Any]:
-    """두 KV Cache 기술을 클라우드 LLM 서빙 관점에서 평가한다."""
-    # A → B: 요청을 받고 모든 요청에 적용할 주요 클라우드 시나리오를 생성한다.
-    scenarios = _build_cloud_scenarios(state)
+def _generate_cloud_scenarios_node(
+    state: CloudDomainGraphState,
+) -> dict[str, Any]:
+    """B 노드: 요청에 적용할 클라우드 사용 시나리오를 생성한다."""
+    return {"scenarios": _build_cloud_scenarios(state["global_state"])}
 
-    # B → C: 시나리오를 묶어 최초 검색 질문을 2개까지 생성한다.
-    initial_queries = _build_queries(state)
-    retry_queries: list[str] = []
-    retry_count = 0
 
-    technical_cards = _technical_cards_from_state(state)
-    technologies = {card.get("technology") for card in technical_cards}
+def _generate_search_queries_node(
+    state: CloudDomainGraphState,
+) -> dict[str, Any]:
+    """C 노드: 시나리오를 묶은 최초 검색 질문을 생성한다."""
+    queries = _build_queries(state["global_state"])
+    return {
+        "initial_queries": queries,
+        "active_queries": queries,
+    }
 
-    # 클라우드 비교의 공통 출발점인 두 기술의 논문 근거가 모두 있어야 한다.
-    if not {"TurboQuant", "CXL-based"}.issubset(technologies):
-        return _empty_result(
-            status="insufficient_evidence",
-            summary="두 기술의 기술 조사 근거가 모두 준비되지 않았습니다.",
-            queries=initial_queries,
-            retry_queries=retry_queries,
-            retry_count=retry_count,
-            limitations=["TurboQuant와 CXL-based 기술 근거가 모두 필요합니다."],
-            errors=[],
-        )
 
-    # C → D: 같은 질문으로 Tavily와 논문 Vector DB를 모두 조회한다.
-    web_results, search_errors = _search_cloud_sources(initial_queries)
-    vector_chunks, vector_errors = _search_vector_sources(initial_queries)
-    all_errors = [*search_errors, *vector_errors]
+def _retrieve_sources_node(state: CloudDomainGraphState) -> dict[str, Any]:
+    """D 노드: 같은 질문으로 Tavily와 논문 Vector DB를 모두 조회한다."""
+    active_queries = state.get("active_queries", [])
+    new_web_results, search_errors = _search_cloud_sources(active_queries)
+    new_vector_chunks, vector_errors = _search_vector_sources(active_queries)
 
-    # 검색 결과가 하나도 없으면 평가 전에 1회 재검색한다. 이 재검색까지 포함해
-    # Tavily 질문 수는 최대 3개이므로 팀의 검색 제한도 지킨다.
-    if not web_results and not vector_chunks and retry_count < MAX_RETRIES:
-        all_coverage = [
+    return {
+        "web_results": _merge_web_results(
+            state.get("web_results", []),
+            new_web_results,
+        ),
+        "vector_chunks": _merge_vector_chunks(
+            state.get("vector_chunks", []),
+            new_vector_chunks,
+        ),
+        "errors": [
+            *state.get("errors", []),
+            *search_errors,
+            *vector_errors,
+        ],
+    }
+
+
+def _extract_related_evidence_node(
+    state: CloudDomainGraphState,
+) -> dict[str, Any]:
+    """E 노드: 검색 결과에서 내용이 있는 기술·사례만 추려낸다."""
+    web_results = [
+        result
+        for result in state.get("web_results", [])
+        if str(result.get("url", "")).strip()
+        and str(result.get("content", "")).strip()
+    ]
+    vector_chunks = [
+        chunk
+        for chunk in state.get("vector_chunks", [])
+        if str(chunk.get("content", "")).strip()
+    ]
+    technical_cards = state.get("technical_cards", [])
+    return {
+        "web_results": web_results,
+        "vector_chunks": vector_chunks,
+        "related_source_count": (
+            len(technical_cards) + len(web_results) + len(vector_chunks)
+        ),
+    }
+
+
+def _evaluate_domain_fit_node(
+    state: CloudDomainGraphState,
+) -> dict[str, Any]:
+    """F 노드: 관련 근거를 이용해 시나리오별 도메인 적합성을 평가한다."""
+    scenarios = state.get("scenarios", CLOUD_SCENARIOS)
+    web_results = state.get("web_results", [])
+    vector_chunks = state.get("vector_chunks", [])
+
+    # Tavily와 Vector DB가 모두 비었으면 LLM이 기술 근거만으로 과도하게
+    # 추론하지 않도록 평가를 만들지 않고 모든 시나리오를 부족 상태로 남긴다.
+    if not web_results and not vector_chunks:
+        missing_coverage = [
             (technology, scenario["id"])
             for technology in ("TurboQuant", "CXL-based")
             for scenario in scenarios
         ]
-        retry_query = _build_retry_query(all_coverage)
-        retry_queries.append(retry_query)
-        retry_count += 1
-        retried_web, retry_search_errors = _search_cloud_sources([retry_query])
-        retried_vectors, retry_vector_errors = _search_vector_sources([retry_query])
-        web_results = _merge_web_results(web_results, retried_web)
-        vector_chunks = _merge_vector_chunks(vector_chunks, retried_vectors)
-        all_errors.extend(retry_search_errors)
-        all_errors.extend(retry_vector_errors)
+        return {
+            "missing_coverage": missing_coverage,
+            "summary": "클라우드 평가에 사용할 웹·Vector DB 근거가 없습니다.",
+        }
 
-    if not web_results and not vector_chunks:
-        return _empty_result(
-            # 내부 재검색 1회를 이미 사용했으므로 더 이상 needs_retry로 돌리지 않고
-            # 도식의 J 단계처럼 근거 부족과 평가 한계를 기록하여 반환한다.
-            status="insufficient_evidence",
-            summary="클라우드 평가에 사용할 웹·Vector DB 근거를 확보하지 못했습니다.",
-            queries=initial_queries,
-            retry_queries=retry_queries,
-            retry_count=retry_count,
-            limitations=[
-                "최대 1회 재검색 후에도 클라우드 평가 근거를 확보하지 못했습니다."
-            ],
-            errors=all_errors,
-        )
-
-    # D → E → F: 검색 결과에서 기술·사례를 추출하고 시나리오별 적합성을 평가한다.
+    required_coverage = (
+        state.get("missing_coverage") if state.get("retry_count", 0) > 0 else None
+    )
     try:
         extraction = _extract_cloud_assessment(
-            state,
-            technical_cards,
+            state["global_state"],
+            state.get("technical_cards", []),
             web_results,
             vector_chunks,
+            required_coverage=required_coverage,
         )
-        evidence_cards, skipped_findings = _build_evidence_cards(
+        new_cards, skipped_findings = _build_evidence_cards(
             extraction,
-            technical_cards,
+            state.get("technical_cards", []),
             web_results,
             vector_chunks,
         )
     except Exception as error:  # noqa: BLE001
-        return _empty_result(
-            status="failed",
-            summary="클라우드 평가 결과를 생성하지 못했습니다.",
-            queries=initial_queries,
-            retry_queries=retry_queries,
-            retry_count=retry_count,
-            limitations=[],
-            errors=[*all_errors, str(error)],
-        )
+        return {
+            "fatal_error": str(error),
+            "errors": [*state.get("errors", []), str(error)],
+        }
 
-    limitations = list(extraction.limitations)
-    if skipped_findings:
-        limitations.append("일부 주장은 입력 근거와 출처 URL이 연결되지 않아 제외했습니다.")
-
-    # F → G: 7개 주요 시나리오가 두 기술 모두에 대해 평가됐는지 확인한다.
-    all_findings = list(extraction.findings)
-    missing_coverage = _missing_scenario_coverage(
-        evidence_cards,
-        scenarios,
-        all_findings,
+    evidence_cards = _merge_evidence_cards(
+        state.get("evidence_cards", []),
+        new_cards,
     )
-
-    # G(아니오) → H → I(예) → D: 검색 예산이 남았을 때 부족한 시나리오만
-    # 대상으로 한 질문을 만들어 Tavily와 Vector DB를 한 번 더 조회한다.
-    if missing_coverage and retry_count < MAX_RETRIES:
-        retry_query = _build_retry_query(missing_coverage)
-        retry_queries.append(retry_query)
-        retry_count += 1
-
-        retried_web, retry_search_errors = _search_cloud_sources([retry_query])
-        retried_vectors, retry_vector_errors = _search_vector_sources([retry_query])
-        web_results = _merge_web_results(web_results, retried_web)
-        vector_chunks = _merge_vector_chunks(vector_chunks, retried_vectors)
-        all_errors.extend(retry_search_errors)
-        all_errors.extend(retry_vector_errors)
-
-        try:
-            retry_extraction = _extract_cloud_assessment(
-                state,
-                technical_cards,
-                web_results,
-                vector_chunks,
-                required_coverage=missing_coverage,
-            )
-            retry_cards, retry_skipped = _build_evidence_cards(
-                retry_extraction,
-                technical_cards,
-                web_results,
-                vector_chunks,
-            )
-            evidence_cards = _merge_evidence_cards(evidence_cards, retry_cards)
-            all_findings.extend(retry_extraction.findings)
-            skipped_findings.extend(retry_skipped)
-            limitations.extend(retry_extraction.limitations)
-            extraction.comparison.update(retry_extraction.comparison)
-        except Exception as error:  # noqa: BLE001
-            all_errors.append(f"부족한 시나리오 재평가 실패: {error}")
-
-        missing_coverage = _missing_scenario_coverage(
-            evidence_cards,
-            scenarios,
-            all_findings,
+    findings = [*state.get("findings", []), *extraction.findings]
+    comparison = dict(state.get("comparison", {}))
+    comparison.update(extraction.comparison)
+    limitations = [*state.get("limitations", []), *extraction.limitations]
+    if skipped_findings:
+        limitations.append(
+            "일부 주장은 입력 근거와 출처 URL이 연결되지 않아 제외했습니다."
         )
 
-    # I(아니오) → J: 1회 재검색 후에도 근거가 부족한 시나리오는 한계로 기록한다.
+    return {
+        "evidence_cards": evidence_cards,
+        "findings": findings,
+        "comparison": comparison,
+        "summary": extraction.summary,
+        "limitations": list(dict.fromkeys(limitations)),
+        "skipped_findings": [
+            *state.get("skipped_findings", []),
+            *skipped_findings,
+        ],
+        "fatal_error": "",
+    }
+
+
+def _check_scenario_coverage_node(
+    state: CloudDomainGraphState,
+) -> dict[str, Any]:
+    """G 노드: 7개 시나리오가 두 기술 모두에서 평가됐는지 확인한다."""
+    if state.get("fatal_error"):
+        return {}
+    missing_coverage = _missing_scenario_coverage(
+        state.get("evidence_cards", []),
+        state.get("scenarios", CLOUD_SCENARIOS),
+        state.get("findings", []),
+    )
+    return {"missing_coverage": missing_coverage}
+
+
+def _route_after_scenario_check(state: CloudDomainGraphState) -> str:
+    """G 조건 분기: 완료면 K, 부족하면 H, 치명적 오류면 J로 이동한다."""
+    if state.get("fatal_error"):
+        return "record_limitations"
+    if state.get("missing_coverage"):
+        return "prepare_retry"
+    return "return_domain_result"
+
+
+def _prepare_retry_node(state: CloudDomainGraphState) -> dict[str, Any]:
+    """H 노드: 근거가 부족한 시나리오만 대상으로 재검색 질문을 만든다."""
+    retry_count = state.get("retry_count", 0)
+    used_query_count = len(state.get("initial_queries", [])) + len(
+        state.get("retry_queries", [])
+    )
+    retry_possible = (
+        retry_count < MAX_RETRIES and used_query_count < MAX_SEARCH_QUERIES
+    )
+    if not retry_possible:
+        return {"retry_possible": False}
+
+    retry_query = _build_retry_query(state.get("missing_coverage", []))
+    return {
+        "active_queries": [retry_query],
+        "retry_queries": [*state.get("retry_queries", []), retry_query],
+        "retry_count": retry_count + 1,
+        "retry_possible": True,
+    }
+
+
+def _check_retry_available_node(
+    state: CloudDomainGraphState,
+) -> dict[str, Any]:
+    """I 노드: H에서 계산한 재시도 가능 여부를 명시적으로 보존한다."""
+    return {"retry_possible": bool(state.get("retry_possible", False))}
+
+
+def _route_after_retry_check(state: CloudDomainGraphState) -> str:
+    """I 조건 분기: 가능하면 D로 돌아가고 불가능하면 J로 이동한다."""
+    return "retrieve_sources" if state.get("retry_possible") else "record_limitations"
+
+
+def _record_limitations_node(
+    state: CloudDomainGraphState,
+) -> dict[str, Any]:
+    """J 노드: 재검색 후에도 남은 시나리오와 실행 오류를 한계로 기록한다."""
+    limitations = list(state.get("limitations", []))
+    missing_coverage = state.get("missing_coverage", [])
     if missing_coverage:
         missing_text = ", ".join(
             f"{technology}:{criterion}"
@@ -734,34 +817,143 @@ def cloud_domain_agent(state: GlobalState) -> dict[str, Any]:
         limitations.append(
             "최대 1회 재검색 후에도 근거가 부족한 시나리오: " + missing_text
         )
-
-    if all_errors:
+    if state.get("fatal_error"):
+        limitations.append("클라우드 도메인 구조화 평가에 실패했습니다.")
+    if state.get("errors"):
         limitations.append("일부 Tavily 또는 Vector DB 조회가 실패했습니다.")
+    return {"limitations": list(dict.fromkeys(limitations))}
 
-    # G(예) 또는 J → K: 모든 경우 공통 AgentResult 형식으로 평가를 반환한다.
-    status = "ok" if evidence_cards and not missing_coverage else "insufficient_evidence"
 
-    return {
-        "cloud_domain_result": {
-            "agent_name": "cloud_domain_evaluation",
-            "status": status,
-            "summary": extraction.summary,
-            "evidence_ids": [card["evidence_id"] for card in evidence_cards],
-            "limitations": limitations,
-            "errors": all_errors,
-            "payload": {
-                "evaluation_criteria": CLOUD_EVALUATION_CRITERIA,
-                "scenarios": scenarios,
-                "search_queries": initial_queries,
-                "retry_queries": retry_queries,
-                "retry_count": retry_count,
-                "missing_scenarios": _format_missing_coverage(missing_coverage),
-                "comparison": extraction.comparison,
-                "finding_count": len(evidence_cards),
-                "web_source_count": len(web_results),
-                "vector_source_count": len(vector_chunks),
-                "skipped_findings": skipped_findings,
-            },
+def _return_domain_result_node(
+    state: CloudDomainGraphState,
+) -> dict[str, Any]:
+    """K 노드: 지정된 AgentResult와 EvidenceCard 형식으로 결과를 반환한다."""
+    evidence_cards = state.get("evidence_cards", [])
+    missing_coverage = state.get("missing_coverage", [])
+    fatal_error = state.get("fatal_error", "")
+
+    if fatal_error:
+        status = "failed"
+    elif evidence_cards and not missing_coverage:
+        status = "ok"
+    else:
+        status = "insufficient_evidence"
+
+    result = {
+        "agent_name": "cloud_domain_evaluation",
+        "status": status,
+        "summary": state.get(
+            "summary",
+            "클라우드 도메인 평가를 완료하지 못했습니다.",
+        ),
+        "evidence_ids": [card["evidence_id"] for card in evidence_cards],
+        "limitations": state.get("limitations", []),
+        "errors": state.get("errors", []),
+        "payload": {
+            "evaluation_criteria": CLOUD_EVALUATION_CRITERIA,
+            "scenarios": state.get("scenarios", CLOUD_SCENARIOS),
+            "search_queries": state.get("initial_queries", []),
+            "retry_queries": state.get("retry_queries", []),
+            "retry_count": state.get("retry_count", 0),
+            "missing_scenarios": _format_missing_coverage(missing_coverage),
+            "comparison": state.get("comparison", {}),
+            "finding_count": len(evidence_cards),
+            "web_source_count": len(state.get("web_results", [])),
+            "vector_source_count": len(state.get("vector_chunks", [])),
+            "related_source_count": state.get("related_source_count", 0),
+            "skipped_findings": state.get("skipped_findings", []),
         },
-        "evidence_cards": evidence_cards,
+    }
+    return {"cloud_domain_result": result}
+
+
+def build_cloud_domain_graph():
+    """고정된 B~K 도식을 LangGraph 서브그래프로 구성한다."""
+    graph = StateGraph(CloudDomainGraphState)
+
+    # 도식의 사각형 단계를 각각 독립 노드로 등록한다.
+    graph.add_node("generate_scenarios", _generate_cloud_scenarios_node)  # B
+    graph.add_node("generate_search_queries", _generate_search_queries_node)  # C
+    graph.add_node("retrieve_sources", _retrieve_sources_node)  # D
+    graph.add_node("extract_related_evidence", _extract_related_evidence_node)  # E
+    graph.add_node("evaluate_domain_fit", _evaluate_domain_fit_node)  # F
+    graph.add_node("check_scenario_coverage", _check_scenario_coverage_node)  # G
+    graph.add_node("prepare_retry", _prepare_retry_node)  # H
+    graph.add_node("check_retry_available", _check_retry_available_node)  # I
+    graph.add_node("record_limitations", _record_limitations_node)  # J
+    graph.add_node("return_domain_result", _return_domain_result_node)  # K
+
+    graph.add_edge(START, "generate_scenarios")
+    graph.add_edge("generate_scenarios", "generate_search_queries")
+    graph.add_edge("generate_search_queries", "retrieve_sources")
+    graph.add_edge("retrieve_sources", "extract_related_evidence")
+    graph.add_edge("extract_related_evidence", "evaluate_domain_fit")
+    graph.add_edge("evaluate_domain_fit", "check_scenario_coverage")
+    graph.add_conditional_edges(
+        "check_scenario_coverage",
+        _route_after_scenario_check,
+        {
+            "prepare_retry": "prepare_retry",
+            "record_limitations": "record_limitations",
+            "return_domain_result": "return_domain_result",
+        },
+    )
+    graph.add_edge("prepare_retry", "check_retry_available")
+    graph.add_conditional_edges(
+        "check_retry_available",
+        _route_after_retry_check,
+        {
+            "retrieve_sources": "retrieve_sources",
+            "record_limitations": "record_limitations",
+        },
+    )
+    graph.add_edge("record_limitations", "return_domain_result")
+    graph.add_edge("return_domain_result", END)
+
+    return graph.compile()
+
+
+CLOUD_DOMAIN_GRAPH = build_cloud_domain_graph()
+
+
+def cloud_domain_agent(state: GlobalState) -> dict[str, Any]:
+    """A 요청을 받아 클라우드 LangGraph를 실행하고 K 결과만 GlobalState에 반환한다."""
+    technical_cards = _technical_cards_from_state(state)
+    technologies = {card.get("technology") for card in technical_cards}
+
+    # 기술 조사 결과가 없으면 검색 이전의 필수 입력이 누락된 것이므로 공통 실패
+    # 형식으로 반환한다. 정상 입력은 아래 LangGraph의 B 노드부터 실행된다.
+    if not {"TurboQuant", "CXL-based"}.issubset(technologies):
+        return _empty_result(
+            status="insufficient_evidence",
+            summary="두 기술의 기술 조사 근거가 모두 준비되지 않았습니다.",
+            queries=_build_queries(state),
+            retry_queries=[],
+            retry_count=0,
+            limitations=["TurboQuant와 CXL-based 기술 근거가 모두 필요합니다."],
+            errors=[],
+        )
+
+    graph_result = CLOUD_DOMAIN_GRAPH.invoke(
+        {
+            "global_state": state,
+            "technical_cards": technical_cards,
+            "retry_queries": [],
+            "retry_count": 0,
+            "retry_possible": False,
+            "web_results": [],
+            "vector_chunks": [],
+            "evidence_cards": [],
+            "findings": [],
+            "comparison": {},
+            "missing_coverage": [],
+            "limitations": [],
+            "errors": [],
+            "skipped_findings": [],
+            "fatal_error": "",
+        }
+    )
+    return {
+        "cloud_domain_result": graph_result["cloud_domain_result"],
+        "evidence_cards": graph_result.get("evidence_cards", []),
     }

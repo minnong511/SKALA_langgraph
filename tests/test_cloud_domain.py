@@ -197,6 +197,25 @@ def test_cloud_domain_agent_follows_scenarios_and_common_result_format(
         assert card["claim_type"] == "inference"
 
 
+def test_cloud_domain_graph_contains_fixed_flow_nodes() -> None:
+    """B~K 단계가 실제 LangGraph add_node로 등록됐는지 확인한다."""
+    graph = cloud_domain.build_cloud_domain_graph().get_graph()
+    expected_nodes = {
+        "generate_scenarios",
+        "generate_search_queries",
+        "retrieve_sources",
+        "extract_related_evidence",
+        "evaluate_domain_fit",
+        "check_scenario_coverage",
+        "prepare_retry",
+        "check_retry_available",
+        "record_limitations",
+        "return_domain_result",
+    }
+
+    assert expected_nodes.issubset(graph.nodes)
+
+
 def test_cloud_domain_agent_researches_missing_scenarios_once(monkeypatch) -> None:
     searched_queries: list[str] = []
     extraction_calls = 0
@@ -327,6 +346,8 @@ def test_cloud_domain_prompt_uses_required_yaml_format() -> None:
         "constraints",
     }
     assert prompt["agent_name"] == "cloud_domain_evaluation"
+    assert prompt["constraints"]["orchestration"] == "langgraph"
+    assert prompt["constraints"]["fixed_graph_flow"] is True
     assert prompt["constraints"]["maximum_initial_search_queries"] == 2
     assert prompt["constraints"]["maximum_search_queries"] == 3
     assert prompt["constraints"]["maximum_retries"] == 1
