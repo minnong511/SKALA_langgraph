@@ -61,3 +61,38 @@ class FoundationState(TypedDict, total=False):
     coverage: list[CoverageItem]
     active_task_ids: list[str]
     budget_usage: dict[str, int]
+
+
+from langgraph.managed import RemainingSteps
+
+from kv_cache_agent.schemas.evidence import SourceRef
+from kv_cache_agent.schemas.research import ResearchTask, SupervisorDecision
+from kv_cache_agent.schemas.supervision import WorkerDelivery
+from kv_cache_agent.schemas.worker import WorkerInput
+
+
+class SupervisedState(FoundationState, total=False):
+    user_query: str
+    workflow_run_id: str
+    source_refs: tuple[SourceRef, ...]
+    # Only coordinator nodes write section drafts, including partial cells of one round.
+    drafts_by_section: dict[str, SectionDraft]
+    deliveries: Annotated[dict[str, WorkerDelivery], merge_versioned]
+    tasks_by_id: dict[str, ResearchTask]
+    active_requests: dict[str, WorkerInput]
+    processed_task_ids: list[str]
+    verification_inputs: dict[str, str]
+    semantic_gaps: dict[str, tuple[str, ...]]
+    decision: SupervisorDecision
+    decisions: list[SupervisorDecision]
+    round_id: int
+    no_progress_rounds: int
+    round_pending_progress: bool
+    progress_baseline: dict
+    remaining_steps: RemainingSteps
+    errors: list[str]
+    fatal_errors: list[str]
+    status: str
+    termination_reason: str
+    finalization_input: dict
+    finalization_result: dict

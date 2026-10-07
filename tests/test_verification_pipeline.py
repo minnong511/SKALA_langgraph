@@ -342,3 +342,39 @@ def test_true_source_fact_cannot_fill_an_unanswered_criterion(assessment):
     assert result.decisions[0].status != "verified"
     assert result.coverage[0].status == "unsupported"
     assert result.revision_requests
+
+
+def test_multi_worker_verification_batches_are_bounded_by_unique_source_size():
+    refs = []
+    evidence = []
+    claims = []
+    snapshots = {}
+    for index in range(2):
+        ref, card, claim = inputs(source_url=f"https://docs.nvidia.com/page{index}")
+        ref = ref.model_copy(update={"source_id": f"source-{index}"})
+        card = card.model_copy(
+            update={"evidence_id": f"e-{index}", "source_refs": (ref,)}
+        )
+        claim = claim.model_copy(
+            update={"claim_id": f"c-{index}", "evidence_ids": (card.evidence_id,)}
+        )
+        snapshots[ref.source_id] = SourceSnapshot(
+            reference=ref,
+            content="Memory usage is reduced. " + ("padding " * 8000),
+            acquisition="tavily_extract",
+            status="ok",
+        )
+        refs.append(ref)
+        evidence.append(card)
+        claims.append(claim)
+    calls = []
+
+    def judge(batch, cards, sources):
+        calls.append(len(batch))
+        return supporting_judge(batch, cards, sources)
+
+    result = VerificationPipeline(
+        loader=lambda ref: snapshots[ref.source_id], judge=judge
+    ).verify(claims, evidence)
+    assert result.status == "ok"
+    assert calls == [1, 1]

@@ -8,7 +8,7 @@ from time import monotonic
 from typing import Any
 
 from langchain_core.runnables import RunnableConfig
-from langsmith.run_helpers import tracing_context
+from langsmith.run_helpers import get_current_run_tree, tracing_context
 
 from kv_cache_agent.observability.events import summary
 from kv_cache_agent.observability.logger import CURRENT_CONTEXT, child_context, emit
@@ -45,18 +45,21 @@ def logged_node(name: str, function):
             thread = Thread(target=lambda: copied.run(heartbeat), daemon=True)
             thread.start()
         try:
-            with tracing_context(
-                metadata={
-                    "application_run_id": context.session.run_id,
-                    "node_invocation_id": context.invocation_id,
-                    "node_path": context.node_path,
-                    "task_id": context.task_id,
-                    "round_id": context.round_id,
-                    "section_ids": list(context.section_ids),
-                    "technologies": list(context.technologies),
-                    "criteria": list(context.criteria),
-                }
-            ):
+            metadata = {
+                "application_run_id": context.session.run_id,
+                "node_invocation_id": context.invocation_id,
+                "node_path": context.node_path,
+                "task_id": context.task_id,
+                "agent": context.agent,
+                "round_id": context.round_id,
+                "section_ids": list(context.section_ids),
+                "technologies": list(context.technologies),
+                "criteria": list(context.criteria),
+            }
+            current_run = get_current_run_tree()
+            if current_run is not None:
+                current_run.add_metadata(metadata)
+            with tracing_context(metadata=metadata):
                 result = (
                     function(state, config=config)
                     if "config" in inspect.signature(function).parameters

@@ -28,12 +28,10 @@ class TracingSettings:
         )
 
     def make_client(self) -> Client | None:
+        self.validate()
         if not self.enabled:
             return None
-        if not self.api_key or not self.project:
-            raise ValueError(
-                "LANGSMITH_API_KEY and LANGSMITH_PROJECT are required for tracing"
-            )
+
         return Client(
             api_key=self.api_key,
             api_url=self.endpoint,
@@ -42,6 +40,14 @@ class TracingSettings:
             hide_outputs=redact,
             hide_metadata=redact,
         )
+
+    def validate(self) -> None:
+        if not self.enabled:
+            return
+        if not self.api_key or not self.project:
+            raise ValueError(
+                "LANGSMITH_API_KEY and LANGSMITH_PROJECT are required for tracing"
+            )
 
 
 def traced_tool(name: str):

@@ -23,9 +23,12 @@ class ResearchTask(Contract):
     questions: tuple[str, ...] = ()
     existing_evidence_ids: tuple[str, ...] = ()
     feedback: tuple[str, ...] = ()
+    unanswered_questions: tuple[str, ...] = ()
     action: Literal["research", "revise"] = "research"
     max_search_calls: int = Field(default=3, ge=0)
     max_model_calls: int = Field(default=1, ge=0)
+    max_extract_calls: int = Field(default=2, ge=0)
+    max_extract_urls: int = Field(default=6, ge=0)
     draft_versions: dict[str, int] = Field(default_factory=dict)
 
     @model_validator(mode="after")
@@ -79,6 +82,7 @@ class SupervisorDecision(Contract):
     reason: str = Field(min_length=1)
     tasks: tuple[ResearchTask, ...] = ()
     claim_ids: tuple[str, ...] = ()
+    unresolved_questions: dict[str, tuple[str, ...]] = Field(default_factory=dict)
 
     @model_validator(mode="after")
     def valid_action(self):
@@ -139,16 +143,20 @@ class BudgetLedger:
             for key in ("search_calls", "extract_calls", "extract_urls", "model_calls")
         }
         self._lock = Lock()
+        self._held = dict.fromkeys(self.used, 0)
+
+    def _capacity(self, key, finishing=False):
+        cap = getattr(self.limits, key)
+        if key == "model_calls" and not finishing:
+            cap -= self.limits.finish_reserve
+        return cap - self.used[key] - self._held[key]
 
     def reserve(self, *, finishing: bool = False, **amounts: int) -> None:
         with self._lock:
             for key, amount in amounts.items():
                 if key not in self.used or not isinstance(amount, int) or amount < 0:
                     raise ValueError("Invalid budget reservation")
-                cap = getattr(self.limits, key)
-                if key == "model_calls" and not finishing:
-                    cap -= self.limits.finish_reserve
-                if self.used[key] + amount > cap:
+                if amount > self._capacity(key, finishing):
                     raise BudgetExceeded(f"Budget exhausted: {key}")
             for key, amount in amounts.items():
                 self.used[key] += amount
@@ -156,6 +164,79 @@ class BudgetLedger:
     def snapshot(self) -> dict[str, int]:
         with self._lock:
             return dict(self.used)
+
+    def available(self, *, finishing: bool = False) -> dict[str, int]:
+        with self._lock:
+            return {key: self._capacity(key, finishing) for key in self.used}
+
+    def held_snapshot(self) -> dict[str, int]:
+        with self._lock:
+            return dict(self._held)
+
+    def allocate_many(
+        self,
+        allocations: dict[str, dict[str, int]],
+        *,
+        retain: dict[str, int] | None = None,
+    ) -> dict[str, "BudgetReservation"]:
+        """Hold a complete dispatch atomically; count only attempted calls as used."""
+        with self._lock:
+            totals = dict.fromkeys(self.used, 0)
+            for amounts in (*allocations.values(), retain or {}):
+                for key, amount in amounts.items():
+                    if key not in totals or not isinstance(amount, int) or amount < 0:
+                        raise ValueError("Invalid budget allocation")
+                    totals[key] += amount
+            for key, amount in totals.items():
+                if amount > self._capacity(key):
+                    raise BudgetExceeded(f"Dispatch budget exhausted: {key}")
+            reservations = {}
+            for task_id, amounts in allocations.items():
+                caps = {key: amounts.get(key, 0) for key in self.used}
+                for key, cap in caps.items():
+                    self._held[key] += cap
+                reservations[task_id] = BudgetReservation(self, caps)
+            return reservations
+
+
+class BudgetReservation:
+    """Unused capacity returns at completion; failed attempts remain charged."""
+
+    def __init__(self, ledger: BudgetLedger, caps: dict[str, int]):
+        self.ledger = ledger
+        self.limits = ledger.limits
+        self.remaining = dict(caps)
+        self.used = dict.fromkeys(caps, 0)
+        self.closed = False
+
+    def reserve(self, *, finishing: bool = False, **amounts):
+        with self.ledger._lock:
+            if self.closed or finishing:
+                raise BudgetExceeded(
+                    "Worker reservation is closed or used for finalization"
+                )
+            for key, amount in amounts.items():
+                if key not in self.used or not isinstance(amount, int) or amount < 0:
+                    raise ValueError("Invalid reservation use")
+                if amount > self.remaining[key]:
+                    raise BudgetExceeded(f"Task allocation exhausted: {key}")
+            for key, amount in amounts.items():
+                self.remaining[key] -= amount
+                self.ledger._held[key] -= amount
+                self.ledger.used[key] += amount
+                self.used[key] += amount
+
+    def snapshot(self):
+        with self.ledger._lock:
+            return dict(self.used)
+
+    def close(self):
+        with self.ledger._lock:
+            if not self.closed:
+                for key, amount in self.remaining.items():
+                    self.ledger._held[key] -= amount
+                self.remaining = dict.fromkeys(self.remaining, 0)
+                self.closed = True
 
 
 def merge_versioned(

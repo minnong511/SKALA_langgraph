@@ -14,4 +14,6 @@ def get_llm() -> ChatOpenAI:
         model=OPENAI_MODEL,
         api_key=OPENAI_API_KEY,
         temperature=0,
+        # Retry decisions are owned by the bounded workflow, not hidden SDK calls.
+        max_retries=0,
     )

@@ -694,3 +694,78 @@ def test_fabricated_worker_number_is_rejected_by_shared_verifier(sources):
         loader=SourceLoader(root=collector.root).load, judge=judge
     ).verify(list(result.drafts[0].claims), list(result.evidence))
     assert all(d.status == "unsupported" for d in verification.decisions)
+
+
+def test_real_worker_subgraphs_and_shared_verifier_run_inside_supervised_loop(sources):
+    from kv_cache_agent.agents.supervisor_control import SupervisorController
+    from kv_cache_agent.graph.workflow import build_supervised_workflow
+    from kv_cache_agent.schemas.report import SectionSpec
+    from kv_cache_agent.schemas.supervision import ReportOutline
+    from tests.supervised_fixtures import choose_missing
+
+    collector, extractor, search, _ = sources
+    base = request().plan
+    sections = tuple(
+        s.model_copy(
+            update={
+                "criteria": ("memory",),
+                "questions": ("What original evidence documents memory effects?",),
+            }
+        )
+        for s in base.sections
+    )
+    sections = (
+        *sections,
+        SectionSpec(
+            section_id="conclusion",
+            title="Conclusion",
+            order=4,
+            owner="supervisor",
+            objective="Compare supported results",
+        ),
+    )
+    supervisor = SupervisorController(
+        planner=lambda q, config=None: ReportOutline(sections=sections),
+        router=choose_missing,
+    )
+    workers = {
+        role: ResearchWorker(role, collector=collector, draft=findings)
+        for role in ROLES
+    }
+
+    def judge(claims, evidence, snapshots):
+        return JudgementBatch(
+            decisions=[
+                ClaimJudgement(
+                    claim_id=c.claim_id,
+                    support_level="full",
+                    matched_text=c.text,
+                    rationale="Exact retrieved original sentence",
+                    claim_type_assessment="correct",
+                    criterion_assessment="relevant",
+                )
+                for c in claims
+            ]
+        )
+
+    result = build_supervised_workflow(
+        supervisor=supervisor,
+        workers=workers,
+        verifier_factory=lambda budget: VerificationPipeline(
+            loader=SourceLoader(
+                root=collector.root, extractor=extractor, budget=budget
+            ).load,
+            judge=judge,
+            budget=budget,
+        ),
+    ).invoke({"user_query": base.user_query})
+    assert result["status"] == "ready_for_finalization", result.get("fatal_errors")
+    assert len(result["task_results"]) == 4 and all(
+        c.status == "verified" for c in result["coverage"]
+    )
+    assert result["budget_usage"]["model_calls"] == 10
+    assert search.call_count == result["budget_usage"]["search_calls"] == 6
+    assert (
+        result["budget_usage"]["extract_calls"] == 1
+        and result["budget_usage"]["extract_urls"] == 2
+    )

@@ -44,6 +44,8 @@ class TaskBudget:
             for key, maximum in (
                 ("search_calls", self.task.max_search_calls),
                 ("model_calls", self.task.max_model_calls),
+                ("extract_calls", self.task.max_extract_calls),
+                ("extract_urls", self.task.max_extract_urls),
             ):
                 if self.used[key] + amounts.get(key, 0) > maximum:
                     raise BudgetExceeded(f"Task budget exhausted: {key}")
@@ -221,6 +223,24 @@ class SourceCollector:
         identities = set()
         characters = 0
 
+        def bounded_urls(urls):
+            remaining = request.task.max_extract_urls - budget.used["extract_urls"]
+            selected = []
+            for url in urls:
+                cached = (
+                    extractor.cache.get(url, extractor.clock())
+                    if extractor.cache
+                    else None
+                )
+                if cached is not None:
+                    selected.append(url)
+                elif remaining > 0:
+                    selected.append(url)
+                    remaining -= 1
+                else:
+                    limitations.append(f"Extraction URL budget cannot fetch {url}")
+            return selected
+
         def add(snapshot):
             nonlocal characters
             if (
@@ -274,6 +294,26 @@ class SourceCollector:
             for card in result.evidence:
                 if card.technology in request.task.technologies:
                     refs.extend(card.source_refs)
+        failed_prefetch = {}
+        if extractor.cache:
+            urls = list(
+                dict.fromkeys(
+                    canonical_url(ref.location)
+                    for ref in refs
+                    if ref.location.startswith("http")
+                )
+            )
+            selected_urls = bounded_urls(urls)
+            if selected_urls:
+                try:
+                    prefetched = extractor.extract(selected_urls, budget=budget)
+                    failed_prefetch = {
+                        s.reference.location: s
+                        for s in prefetched.snapshots
+                        if s.status != "ok"
+                    }
+                except BudgetExceeded as error:
+                    limitations.append(str(error))
         seen_refs = set()
         for ref in refs:
             key = (reference_key(ref), ref.version)
@@ -281,6 +321,12 @@ class SourceCollector:
                 continue
             seen_refs.add(key)
             try:
+                if (
+                    ref.location.startswith("http")
+                    and canonical_url(ref.location) in failed_prefetch
+                ):
+                    add(failed_prefetch[canonical_url(ref.location)])
+                    continue
                 actual = load(ref)
                 if ref.version and actual.reference.version != ref.version:
                     raise ValueError("Requested source version changed")
@@ -391,7 +437,7 @@ class SourceCollector:
                         break
                 if budget.used["search_calls"] >= request.task.max_search_calls:
                     break
-            urls = list(hits)[:MAX_WEB_URLS]
+            urls = bounded_urls(list(hits)[:MAX_WEB_URLS])
             if urls:
                 try:
                     batch = extractor.extract(urls, budget=budget)

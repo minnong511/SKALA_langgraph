@@ -26,6 +26,7 @@ class ExecutionContext:
     invocation_id: str | None = None
     parent_invocation_id: str | None = None
     task_id: str | None = None
+    agent: str | None = None
     round_id: int | None = None
     section_ids: tuple[str, ...] = ()
     technologies: tuple[str, ...] = ()
@@ -138,6 +139,7 @@ class RunSession:
                 invocation_id=context.invocation_id,
                 parent_invocation_id=context.parent_invocation_id,
                 task_id=context.task_id,
+                agent=context.agent,
                 round_id=context.round_id,
                 section_ids=context.section_ids,
                 technologies=context.technologies,
@@ -156,6 +158,7 @@ class RunSession:
                     "%H:%M:%S"
                 )
                 task = f" task={record.task_id}" if record.task_id else ""
+                agent = f" agent={record.agent}" if record.agent else ""
                 sections = (
                     f" 절={','.join(record.section_ids)}" if record.section_ids else ""
                 )
@@ -169,6 +172,8 @@ class RunSession:
                         if record.technologies
                         else "",
                         f"항목={','.join(record.criteria)}" if record.criteria else "",
+                        f"action={record.action}" if record.action else "",
+                        f"사유={record.reason}" if record.reason else "",
                         f"소요={record.duration_ms / 1000:.2f}s"
                         if record.duration_ms is not None
                         else "",
@@ -196,7 +201,7 @@ class RunSession:
                 )
                 self._logger.log(
                     getattr(logging, record.level),
-                    f"[{clock} {record.level}] {record.node_path} {event}{task}{sections} "
+                    f"[{clock} {record.level}] {record.node_path} {event}{task}{agent}{sections} "
                     f"{scope} {record.message} {record.status or ''} {detail_text}",
                 )
 
@@ -274,6 +279,7 @@ def child_context(node_path: str, state: Any) -> ExecutionContext | None:
         invocation_id=str(uuid4()),
         parent_invocation_id=parent.invocation_id,
         task_id=task.get("task_id", parent.task_id),
+        agent=task.get("agent", parent.agent),
         round_id=task.get("round_id", parent.round_id),
         section_ids=tuple(
             task.get("section_ids", claim_sections or parent.section_ids)

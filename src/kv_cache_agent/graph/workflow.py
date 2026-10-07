@@ -50,3 +50,10 @@ def build_workflow(
     graph.add_edge("report_writer", END)
 
     return graph.compile()
+
+
+def build_supervised_workflow(**dependencies):
+    """Build the stages 9–10 loop; the CLI switches after reporting migration."""
+    from kv_cache_agent.graph.supervised import SupervisedWorkflow
+
+    return SupervisedWorkflow(**dependencies)

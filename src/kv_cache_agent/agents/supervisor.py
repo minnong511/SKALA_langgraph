@@ -18,6 +18,12 @@ EXPECTED_PERSPECTIVES = {
     "cloud_domain",
 }
 
+# New planning/routing service for the Task/Result loop; legacy entrypoint below
+# remains available until the CLI migration.
+from kv_cache_agent.agents.supervisor_control import SupervisorController
+
+__all__ = ["SupervisorController", "supervisor_agent"]
+
 
 class SupervisorConfig(TypedDict, total=False):
     """Supervisor YAML에서 사용하는 설정 형식."""
@@ -52,9 +58,7 @@ def _load_supervisor_config() -> SupervisorConfig:
         )
 
     if set(technologies) != EXPECTED_TECHNOLOGIES:
-        raise ValueError(
-            "technologies에는 TurboQuant와 CXL-based만 정의해야 합니다."
-        )
+        raise ValueError("technologies에는 TurboQuant와 CXL-based만 정의해야 합니다.")
 
     if not isinstance(perspectives, list) or not all(
         isinstance(item, str) and item.strip() for item in perspectives

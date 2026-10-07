@@ -65,6 +65,24 @@ def summary(value: Any) -> dict[str, Any]:
             result[f"{key}_count"] = len(item)
         if key.endswith("_result") and isinstance(item, dict):
             result[f"{key}_status"] = item.get("status")
+        if key == "deliveries" and isinstance(item, dict) and item:
+            statuses = [
+                delivery.result.status
+                for delivery in item.values()
+                if hasattr(delivery, "result")
+            ]
+            if statuses:
+                result["deliveries_status"] = (
+                    "failed"
+                    if "failed" in statuses
+                    else (
+                        "insufficient_evidence"
+                        if "insufficient_evidence" in statuses
+                        else "needs_retry"
+                        if "needs_retry" in statuses
+                        else "ok"
+                    )
+                )
     return result
 
 
@@ -79,12 +97,15 @@ class ExecutionEvent(BaseModel):
     event: str
     level: str = "INFO"
     task_id: str | None = None
+    agent: str | None = None
     round_id: int | None = None
     section_ids: tuple[str, ...] = ()
     technologies: tuple[str, ...] = ()
     criteria: tuple[str, ...] = ()
     status: str | None = None
     message: str = ""
+    action: str | None = None
+    reason: str | None = None
     duration_ms: float | None = None
     details: dict[str, Any] = Field(default_factory=dict)
     langsmith_trace_id: str | None = None

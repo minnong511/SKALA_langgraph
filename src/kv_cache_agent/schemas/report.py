@@ -22,8 +22,19 @@ class SectionSpec(Contract):
     technologies: tuple[Technology, ...] = ()
     perspective: Perspective | None = None
     criteria: tuple[str, ...] = ()
+    direct_evidence_criteria: tuple[str, ...] = ()
     dependencies: tuple[str, ...] = ()
     require_verified_facts: Literal[True] = True
+
+    @model_validator(mode="after")
+    def criterion_requirements(self):
+        if not set(self.direct_evidence_criteria) <= set(self.criteria):
+            raise ValueError("Direct evidence criterion is outside the section")
+        if len(set(self.criteria)) != len(self.criteria) or any(
+            not c.strip() for c in self.criteria
+        ):
+            raise ValueError("Invalid section criteria")
+        return self
 
 
 class ReportPlan(Contract):
