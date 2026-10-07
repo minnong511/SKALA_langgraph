@@ -10,7 +10,7 @@ PAPERS_DIR = DATA_DIR / "papers"
 VECTOR_DB_DIR = DATA_DIR / "vector_db"
 OUTPUTS_DIR = ROOT_DIR / "outputs"
 
-load_dotenv(ROOT_DIR / ".env")
+load_dotenv(ROOT_DIR / ".env", override=True)
 
 TAVILY_API_KEY = os.getenv("TAVILY_API_KEY", "")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
