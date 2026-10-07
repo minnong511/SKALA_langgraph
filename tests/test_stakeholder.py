@@ -41,7 +41,7 @@ def _search_result(
 ) -> dict[str, Any]:
     """Tavily 정규화 결과와 호환되는 목업 검색 결과를 만든다."""
     return {
-        "title": f"{technology} stakeholder source {number}",
+        "title": f"{'TurboQuant CXL-based' if technology == 'both' else technology} stakeholder source {number}",
         "url": f"https://example.com/stakeholder-{number}",
         "content": (
             "The expected benefit is lower serving cost and broader adoption, "

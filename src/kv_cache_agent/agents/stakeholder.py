@@ -12,7 +12,6 @@ from langgraph.graph import END, START, StateGraph
 from kv_cache_agent.graph.state import GlobalState
 from kv_cache_agent.tools import tavily_search as tavily_tool
 
-
 MAX_TAVILY_QUERIES = 3
 MAX_RESULTS_PER_QUERY = 3
 MAX_RETRIES = 1
@@ -50,8 +49,7 @@ STAKEHOLDER_QUERY_TEMPLATES = {
         "performance and service quality"
     ),
     "오픈소스 개발자": (
-        "open source developers TurboQuant CXL-based framework "
-        "support and adoption"
+        "open source developers TurboQuant CXL-based framework support and adoption"
     ),
     "연구자·투자자": (
         "researchers investors TurboQuant CXL-based KV cache "
@@ -249,7 +247,9 @@ def _claim_type(value: Any, text: str) -> str:
         "예상",
     )
     normalized = text.casefold()
-    return "inference" if any(word in normalized for word in inference_words) else "fact"
+    return (
+        "inference" if any(word in normalized for word in inference_words) else "fact"
+    )
 
 
 def _source_type(value: Any, title: str, url: str) -> str:
@@ -269,7 +269,13 @@ def _source_type(value: Any, title: str, url: str) -> str:
         return "blog"
     if any(
         token in combined
-        for token in (".gov", "aws.amazon", "cloud.google", "microsoft.com", "nvidia.com")
+        for token in (
+            ".gov",
+            "aws.amazon",
+            "cloud.google",
+            "microsoft.com",
+            "nvidia.com",
+        )
     ):
         return "official"
     return "official" if urlparse(url).netloc else "blog"
@@ -357,23 +363,27 @@ def _normalize_result(raw_result: Any, query: str) -> dict[str, Any] | None:
         raw_stakeholders, (str, bytes)
     ):
         stakeholders = [
-            str(item)
-            for item in raw_stakeholders
-            if str(item) in STAKEHOLDERS
+            str(item) for item in raw_stakeholders if str(item) in STAKEHOLDERS
         ]
     else:
         stakeholders = []
     if not stakeholders:
         # 검색어에는 여러 이해관계자 유형이 함께 들어갈 수 있으므로,
         # 검색어만으로 유형을 부여하면 근거 본문과 무관한 분류가 생긴다.
-        stakeholders = _stakeholders_from_text(" ".join((title, content)))
+        stakeholders = _stakeholders_from_text(f"{title} {content}")
 
     if not stakeholders:
         return None
 
     claim = str(result.get("claim") or _first_sentence(content)).strip()
     evidence_text = str(result.get("evidence_text") or content).strip()[:2000]
-    combined_text = " ".join((query, title, content))
+    combined_text = f"{title} {content}"
+    if not re.search(
+        r"turboquant|\bcxl\b|kv[ -]?cache|key[ -]?value cache",
+        combined_text,
+        re.IGNORECASE,
+    ):
+        return None
     return {
         "title": title or url,
         "url": url,
@@ -389,9 +399,7 @@ def _normalize_result(raw_result: Any, query: str) -> dict[str, Any] | None:
         "source_type": _source_type(result.get("source_type"), title, url),
         "source_locator": str(result.get("source_locator") or "web page"),
         "published_date": str(
-            result.get("published_date")
-            or result.get("publishedDate")
-            or ""
+            result.get("published_date") or result.get("publishedDate") or ""
         ),
         "confidence": _confidence(result.get("score"), content),
         "caveat": str(
@@ -566,7 +574,9 @@ def _check_stakeholder_evidence(
         for finding in state.get("findings", [])
         if finding.get("stakeholder") in STAKEHOLDERS
     }
-    missing = [stakeholder for stakeholder in STAKEHOLDERS if stakeholder not in covered]
+    missing = [
+        stakeholder for stakeholder in STAKEHOLDERS if stakeholder not in covered
+    ]
     return {
         "missing_stakeholders": missing,
         "sufficient": not missing,
@@ -661,7 +671,9 @@ def _finalize_stakeholder_result(
 
     limitations = ["공개 기업 발표·뉴스·업계 자료와 Tavily 검색 결과만 사용했습니다."]
     if missing:
-        limitations.append("일부 이해관계자는 직접적인 공개 발언을 확인하지 못했습니다.")
+        limitations.append(
+            "일부 이해관계자는 직접적인 공개 발언을 확인하지 못했습니다."
+        )
 
     sources = [
         {

@@ -12,7 +12,6 @@ from langgraph.graph import END, START, StateGraph
 from kv_cache_agent.graph.state import GlobalState
 from kv_cache_agent.tools import tavily_search as tavily_tool
 
-
 MAX_TAVILY_QUERIES = 3
 MAX_RESULTS_PER_QUERY = 3
 
@@ -247,7 +246,9 @@ def _claim_type(value: Any, text: str) -> str:
         "예상",
     )
     normalized = text.casefold()
-    return "inference" if any(word in normalized for word in inference_words) else "fact"
+    return (
+        "inference" if any(word in normalized for word in inference_words) else "fact"
+    )
 
 
 def _source_type(value: Any, title: str, url: str) -> str:
@@ -267,7 +268,13 @@ def _source_type(value: Any, title: str, url: str) -> str:
         return "blog"
     if any(
         token in combined
-        for token in (".gov", "aws.amazon", "cloud.google", "microsoft.com", "nvidia.com")
+        for token in (
+            ".gov",
+            "aws.amazon",
+            "cloud.google",
+            "microsoft.com",
+            "nvidia.com",
+        )
     ):
         return "official"
     return "official" if urlparse(url).netloc else "blog"
@@ -304,7 +311,14 @@ def _normalize_result(raw_result: Any, query: str) -> dict[str, Any] | None:
     if not url or not content:
         return None
 
-    combined_text = " ".join((query, title, content))
+    # 검색어에 기술명이 있다고 결과 본문도 관련 있다고 판단하면 안 된다.
+    combined_text = f"{title} {content}"
+    if not re.search(
+        r"turboquant|\bcxl\b|kv[ -]?cache|key[ -]?value cache",
+        combined_text,
+        re.IGNORECASE,
+    ):
+        return None
     claim = str(result.get("claim") or _first_sentence(content)).strip()
     evidence_text = str(result.get("evidence_text") or content).strip()[:2000]
     technology = _technology_from_text(
@@ -326,9 +340,7 @@ def _normalize_result(raw_result: Any, query: str) -> dict[str, Any] | None:
         "source_type": _source_type(result.get("source_type"), title, url),
         "source_locator": str(result.get("source_locator") or "web page"),
         "published_date": str(
-            result.get("published_date")
-            or result.get("publishedDate")
-            or ""
+            result.get("published_date") or result.get("publishedDate") or ""
         ),
         "confidence": _confidence(result.get("score"), content),
         "caveat": str(
@@ -546,9 +558,7 @@ def _supplement_market_queries(state: MarketLocalState) -> MarketLocalState:
         missing_categories = ["cloud_adoption"]
 
     supplement_queries = [
-        CATEGORY_QUERY_TEMPLATES[category].format(
-            technology="TurboQuant CXL-based"
-        )
+        CATEGORY_QUERY_TEMPLATES[category].format(technology="TurboQuant CXL-based")
         for category in missing_categories[:MAX_TAVILY_QUERIES]
         if category in CATEGORY_QUERY_TEMPLATES
     ]
@@ -730,7 +740,9 @@ def market_evaluation_agent(state: GlobalState) -> dict[str, Any]:
             status="insufficient_evidence",
             summary="기술 조사 근거가 부족하여 시장 평가를 수행할 수 없습니다.",
             queries=queries,
-            limitations=["기술 조사 Agent가 사용할 수 있는 근거를 반환하지 않았습니다."],
+            limitations=[
+                "기술 조사 Agent가 사용할 수 있는 근거를 반환하지 않았습니다."
+            ],
             gaps=["TurboQuant 기술 근거", "CXL-based 기술 근거"],
         )
 

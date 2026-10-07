@@ -41,7 +41,7 @@ def _search_result(
 ) -> dict[str, Any]:
     """Tavily의 정규화된 결과와 호환되는 테스트 결과를 만든다."""
     return {
-        "title": f"{technology} market source {number}",
+        "title": f"{'TurboQuant CXL-based' if technology == 'both' else technology} market source {number}",
         "url": f"https://example.com/{technology.lower()}-{category}-{number}",
         "content": (
             f"{technology} 관련 {category} 자료입니다. "

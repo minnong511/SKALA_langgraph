@@ -27,6 +27,9 @@ class FetchedSource(TypedDict, total=False):
     content: str
     source_type: Literal["web", "pdf"]
     published_date: str
+    authors: str
+    publisher: str
+    retrieved_at: str
     content_length: int
     status_code: int
     content_type: str

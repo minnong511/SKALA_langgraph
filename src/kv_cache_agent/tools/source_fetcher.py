@@ -1,5 +1,7 @@
 """웹 페이지와 PDF 원문을 수집하고 공통 형식으로 반환하는 도구."""
 
+import json
+from datetime import UTC, datetime
 from io import BytesIO
 from pathlib import PurePosixPath
 from typing import Literal
@@ -52,6 +54,55 @@ def _extract_html(response: httpx.Response, url: str) -> tuple[str, str]:
     content_root = soup.find("main") or soup.find("article") or soup.body or soup
     content = content_root.get_text(" ", strip=True)
     return title, content
+
+
+def _html_metadata(response: httpx.Response) -> dict[str, str]:
+    """실제로 페이지에 표시된 날짜·작성자·기관만 추출한다.
+
+    JSON-LD는 본문 정리 과정에서 제거되므로 먼저 읽는다. 게시 날짜가 없으면
+    빈 값으로 유지하며 서버 응답의 Date를 게시일로 오인하지 않는다.
+    """
+    soup = BeautifulSoup(response.text, "html.parser")
+    metadata: dict[str, str] = {}
+    names = {
+        "article:published_time": "published_date",
+        "datepublished": "published_date",
+        "citation_publication_date": "published_date",
+        "date": "published_date",
+        "author": "authors",
+        "citation_author": "authors",
+        "og:site_name": "publisher",
+    }
+    for tag in soup.find_all("meta"):
+        name = str(tag.get("property") or tag.get("name") or "").lower()
+        value = str(tag.get("content") or "").strip()
+        if name in names and value:
+            metadata.setdefault(names[name], value)
+    for tag in soup.find_all("script", attrs={"type": "application/ld+json"}):
+        try:
+            data = json.loads(tag.get_text())
+        except (ValueError, TypeError):
+            continue
+        records = data if isinstance(data, list) else [data]
+        for item in records:
+            if not isinstance(item, dict):
+                continue
+            for node in [item, *item.get("@graph", [])]:
+                if not isinstance(node, dict):
+                    continue
+                if node.get("datePublished"):
+                    metadata.setdefault("published_date", str(node["datePublished"]))
+                for key, field in (("author", "authors"), ("publisher", "publisher")):
+                    value = node.get(key)
+                    people = value if isinstance(value, list) else [value]
+                    label = ", ".join(
+                        str(p.get("name", "")) if isinstance(p, dict) else p
+                        for p in people
+                        if isinstance(p, (str, dict))
+                    )
+                    if label:
+                        metadata.setdefault(field, label)
+    return metadata
 
 
 def _extract_pdf(response: httpx.Response, url: str) -> tuple[str, str]:
@@ -114,10 +165,12 @@ def fetch_source(
             )
         response.raise_for_status()
 
+        metadata = {}
         if _is_pdf(content_type, clean_url):
             title, content = _extract_pdf(response, clean_url)
             source_type = "pdf"
         elif "text/html" in content_type.lower() or not content_type:
+            metadata = _html_metadata(response)
             title, content = _extract_html(response, clean_url)
             source_type = "web"
         else:
@@ -137,7 +190,10 @@ def fetch_source(
             "url": clean_url,
             "content": content,
             "source_type": source_type,
-            "published_date": "",
+            "published_date": metadata.get("published_date", ""),
+            "authors": metadata.get("authors", ""),
+            "publisher": metadata.get("publisher", urlparse(clean_url).netloc),
+            "retrieved_at": datetime.now(tz=UTC).date().isoformat(),
             "content_length": len(content),
             "status_code": response.status_code,
             "content_type": content_type,
@@ -150,9 +206,7 @@ def fetch_source(
             f"원문 수집에 실패했습니다: {error}",
             status_code=error_response.status_code if error_response else 0,
             content_type=(
-                error_response.headers.get("content-type", "")
-                if error_response
-                else ""
+                error_response.headers.get("content-type", "") if error_response else ""
             ),
         )
     except (httpx.HTTPError, ValueError) as error:

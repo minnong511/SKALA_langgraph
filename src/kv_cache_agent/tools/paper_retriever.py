@@ -1,5 +1,6 @@
 """FAISS에 저장된 논문 chunk를 검색하는 도구."""
 
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
@@ -7,6 +8,13 @@ from langchain_community.vectorstores import FAISS
 
 from kv_cache_agent.config import VECTOR_DB_DIR
 from kv_cache_agent.rag.vector_store import load_vector_store, search_vector_store
+from kv_cache_agent.tools.source_metadata import normalize_source
+
+
+@lru_cache(maxsize=2)
+def _cached_store(path: Path):
+    """동일 실행에서 임베딩 모델·인덱스를 매번 다시 로드하지 않는다."""
+    return load_vector_store(path)
 
 
 def retrieve_paper_chunks(
@@ -16,7 +24,7 @@ def retrieve_paper_chunks(
     vector_db_path: Path = VECTOR_DB_DIR,
 ) -> list[dict[str, Any]]:
     """여러 질의로 논문 chunk를 검색하고 중복 결과를 제거한다."""
-    store = vector_store or load_vector_store(vector_db_path)
+    store = vector_store or _cached_store(vector_db_path)
     retrieved: list[dict[str, Any]] = []
     seen_chunk_ids: set[str] = set()
 
@@ -25,7 +33,7 @@ def retrieve_paper_chunks(
             search_vector_store(store, query, top_k=top_k),
             start=1,
         ):
-            metadata = dict(document.metadata)
+            metadata = normalize_source(dict(document.metadata))
             chunk_id = str(
                 metadata.get(
                     "chunk_id",

@@ -114,9 +114,7 @@ _FRACTION_PATTERN = re.compile(
 _NUMBER_WORD_PATTERN = re.compile(
     r"\b(?:" + "|".join(_NUMBER_WORDS) + r")\b", re.IGNORECASE
 )
-_NUMERIC_PATTERN = re.compile(
-    r"(?<![\w.])\d+(?:[.,]\d+)*(?:/\d+(?:[.,]\d+)*)?"
-)
+_NUMERIC_PATTERN = re.compile(r"(?<![\w.])\d+(?:[.,]\d+)*(?:/\d+(?:[.,]\d+)*)?")
 
 
 class Statement(BaseModel):
@@ -175,8 +173,7 @@ def _verified_cards(state: GlobalState) -> tuple[dict[str, dict], list[str]]:
     allowed = {
         key: card
         for key, card in cards.items()
-        if card.get("verification_status")
-        in {"verified", "partially_verified"}
+        if card.get("verification_status") in {"verified", "partially_verified"}
         and all(
             isinstance(card.get(k), str) and card[k].strip()
             for k in ("claim", "evidence_text", "source_title", "source_url")
@@ -214,7 +211,14 @@ def _validate_numbers(text: str, ids: list[str], cards: dict[str, dict]) -> None
     source = " ".join(
         str(cards[key].get(field, ""))
         for key in ids
-        for field in ("claim", "evidence_text", "caveat")
+        for field in (
+            "claim",
+            "evidence_text",
+            "caveat",
+            "published_date",
+            "source_title",
+            "publisher",
+        )
     )
 
     def normalize_fraction(match: re.Match[str]) -> str:
@@ -231,8 +235,11 @@ def _validate_numbers(text: str, ids: list[str], cards: dict[str, dict]) -> None
         normalized = _NUMBER_WORD_PATTERN.sub(normalize_number_word, normalized)
         return set(_NUMERIC_PATTERN.findall(normalized))
 
-    if not numeric_tokens(text) <= numeric_tokens(source):
-        raise ValueError("Numeric claim absent from cited evidence")
+    missing = numeric_tokens(text) - numeric_tokens(source)
+    if missing:
+        raise ValueError(
+            "Numeric claim absent from cited evidence: " + ", ".join(sorted(missing))
+        )
 
 
 def _validation_error_code(error: ValueError) -> str:
@@ -378,6 +385,8 @@ def _synthesis_context(local: SynthesisState) -> dict[str, Any]:
     state, cards = local["request"], local["cards"]
     return {
         "user_query": state.get("user_query", ""),
+        "supervisor_review": state.get("control", {}).get("evidence_review", {}),
+        "supervisor_approved": state.get("control", {}).get("evidence_ready", False),
         "evidence_cards": list(cards.values()),
         "evidence_cards_by_perspective": {
             perspective: [
@@ -408,9 +417,7 @@ def _synthesis_context(local: SynthesisState) -> dict[str, Any]:
             )
         },
         "perspective_limitations": {
-            perspective: state.get(f"{perspective}_result", {}).get(
-                "limitations", []
-            )
+            perspective: state.get(f"{perspective}_result", {}).get("limitations", [])
             for perspective in PERSPECTIVES
         },
     }

@@ -19,6 +19,7 @@ from kv_cache_agent.llm import get_llm
 from kv_cache_agent.schemas.outputs import EvidenceCard
 from kv_cache_agent.schemas.tool_outputs import FetchedSource
 from kv_cache_agent.tools.source_fetcher import fetch_source
+from kv_cache_agent.tools.source_metadata import normalize_source
 
 PROMPT_PATH = Path(__file__).resolve().parents[1] / "prompts" / "verifier.yaml"
 MAX_RETRIES = 1
@@ -119,10 +120,17 @@ def _validate_card_metadata(card: EvidenceCard) -> list[str]:
 def _extract_pdf_pages(path: Path, source_locator: str) -> str:
     """논문 locator의 페이지를 우선 읽고 없으면 PDF 전체에서 일부를 읽는다."""
     reader = PdfReader(str(path))
-    page_numbers = [int(number) for number in re.findall(r"\d+", source_locator)]
+    # chunk ID에 들어 있는 숫자는 페이지 범위가 아니다.
+    page_match = re.search(
+        r"(?:pp?\.?|pages?)\s*(\d+)(?:\s*[-–]\s*(\d+))?", source_locator, re.IGNORECASE
+    )
+    page_numbers = [int(n) for n in page_match.groups() if n] if page_match else []
     if page_numbers:
         start = max(page_numbers[0] - 1, 0)
-        end = min((page_numbers[-1] if len(page_numbers) > 1 else start + 1), len(reader.pages))
+        end = min(
+            (page_numbers[-1] if len(page_numbers) > 1 else start + 1),
+            len(reader.pages),
+        )
         selected_indexes = range(start, max(start + 1, end))
     else:
         selected_indexes = range(min(3, len(reader.pages)))
@@ -137,6 +145,7 @@ def _extract_pdf_pages(path: Path, source_locator: str) -> str:
 
 def _fetch_original_source(card: EvidenceCard) -> FetchedSource:
     """C 단계에서 웹 URL 또는 로컬 논문 PDF의 원문을 다시 확인한다."""
+    card = normalize_source(card)
     source_url = str(card.get("source_url", "")).strip()
     parsed = urlparse(source_url)
     if parsed.scheme in {"http", "https"}:
@@ -175,6 +184,7 @@ def _fetch_original_source(card: EvidenceCard) -> FetchedSource:
             "status_code": 200,
             "content_type": "application/pdf",
             "fetch_status": "ok" if content else "empty",
+            "retrieved_at": datetime.now(tz=UTC).date().isoformat(),
             "error": "",
         }
     except Exception as error:  # noqa: BLE001
@@ -316,17 +326,24 @@ def _recheck_original_sources_node(
     limitations = list(state.get("limitations", []))
     errors = list(state.get("errors", []))
     tavily_fallback_ids = list(state.get("tavily_fallback_ids", []))
-    source_cache: dict[str, FetchedSource] = {}
+    source_cache: dict[tuple[str, str], FetchedSource] = {}
 
     for index, card in enumerate(cards, start=1):
         evidence_id = _card_id(card, index)
         if evidence_id not in active_ids:
             continue
         source_url = str(card.get("source_url", "")).strip()
-        source = source_cache.get(source_url)
+        # 같은 논문의 서로 다른 페이지는 같은 원문 캐시로 취급하지 않는다.
+        locator = (
+            str(card.get("source_locator", ""))
+            if card.get("source_type") == "paper"
+            else ""
+        )
+        cache_key = (source_url, locator)
+        source = source_cache.get(cache_key)
         if source is None:
             source = _fetch_original_source(card)
-            source_cache[source_url] = source
+            source_cache[cache_key] = source
         sources[evidence_id] = source
         if source.get("fetch_status") == "blocked":
             fallback_content = str(card.get("evidence_text", "")).strip()
@@ -354,6 +371,22 @@ def _recheck_original_sources_node(
                 f"{source.get('error', source.get('fetch_status', 'error'))}"
             )
     return {
+        "cards": [
+            {
+                **card,
+                **{
+                    field: sources.get(_card_id(card, index), {}).get(field)
+                    for field in (
+                        "published_date",
+                        "authors",
+                        "publisher",
+                        "retrieved_at",
+                    )
+                    if sources.get(_card_id(card, index), {}).get(field)
+                },
+            }
+            for index, card in enumerate(cards, start=1)
+        ],
         "source_documents": sources,
         "limitations": list(dict.fromkeys(limitations)),
         "errors": list(dict.fromkeys(errors)),
@@ -497,13 +530,11 @@ def _check_comparison_balance_node(
             perspective_counts[technology].add(str(card.get("perspective", "")))
 
     missing_technologies = [
-        technology
-        for technology, count in technology_counts.items()
-        if count == 0
+        technology for technology, count in technology_counts.items() if count == 0
     ]
-    shared_perspectives = perspective_counts["TurboQuant"] & perspective_counts[
-        "CXL-based"
-    ]
+    shared_perspectives = (
+        perspective_counts["TurboQuant"] & perspective_counts["CXL-based"]
+    )
     balanced = not missing_technologies and bool(shared_perspectives)
     return {
         "balance_result": {
@@ -529,7 +560,11 @@ def _check_verification_pass_node(
 
 def _route_after_verification_check(state: VerificationGraphState) -> str:
     """H 조건 분기: 통과하면 L, 실패하면 I로 이동한다."""
-    return "return_verified_result" if state.get("verification_passed") else "request_revision"
+    return (
+        "return_verified_result"
+        if state.get("verification_passed")
+        else "request_revision"
+    )
 
 
 def _request_revision_node(
@@ -572,7 +607,11 @@ def _check_reverification_available_node(
 
 def _route_after_reverification_check(state: VerificationGraphState) -> str:
     """J 조건 분기: 가능하면 C로 돌아가고 불가능하면 K로 이동한다."""
-    return "recheck_original_sources" if state.get("retry_possible") else "mark_uncertainty"
+    return (
+        "recheck_original_sources"
+        if state.get("retry_possible")
+        else "mark_uncertainty"
+    )
 
 
 def _mark_uncertainty_node(
@@ -586,9 +625,7 @@ def _mark_uncertainty_node(
     ]
     limitations = list(state.get("limitations", []))
     if uncertain_ids:
-        limitations.append(
-            "재검증 후에도 불확실한 근거: " + ", ".join(uncertain_ids)
-        )
+        limitations.append("재검증 후에도 불확실한 근거: " + ", ".join(uncertain_ids))
     if not state.get("balance_result", {}).get("balanced"):
         limitations.append("TurboQuant와 CXL-based 비교 근거의 균형이 부족합니다.")
     return {"limitations": list(dict.fromkeys(limitations))}
@@ -633,8 +670,7 @@ def _return_verified_result_node(
             "retry_count": state.get("retry_count", 0),
             "tavily_fallback_ids": state.get("tavily_fallback_ids", []),
             "uncertain_evidence_ids": [
-                str(card.get("evidence_id", ""))
-                for card in [*partial, *unsupported]
+                str(card.get("evidence_id", "")) for card in [*partial, *unsupported]
             ],
         },
     }
@@ -649,11 +685,15 @@ def build_evidence_verification_graph():
     graph.add_node("recheck_original_sources", _recheck_original_sources_node)  # C
     graph.add_node("compare_claim_and_evidence", _compare_claim_and_evidence_node)  # D
     graph.add_node("evaluate_source_quality", _evaluate_source_quality_node)  # E
-    graph.add_node("classify_fact_and_inference", _classify_fact_and_inference_node)  # F
+    graph.add_node(
+        "classify_fact_and_inference", _classify_fact_and_inference_node
+    )  # F
     graph.add_node("check_comparison_balance", _check_comparison_balance_node)  # G
     graph.add_node("check_verification_pass", _check_verification_pass_node)  # H
     graph.add_node("request_revision", _request_revision_node)  # I
-    graph.add_node("check_reverification_available", _check_reverification_available_node)  # J
+    graph.add_node(
+        "check_reverification_available", _check_reverification_available_node
+    )  # J
     graph.add_node("mark_uncertainty", _mark_uncertainty_node)  # K
     graph.add_node("return_verified_result", _return_verified_result_node)  # L
 
@@ -718,7 +758,7 @@ def _empty_verification_result(summary: str) -> dict[str, Any]:
 
 def evidence_verification_agent(state: GlobalState) -> dict[str, Any]:
     """A 입력을 받아 검증 LangGraph를 실행하고 L 결과를 GlobalState에 반환한다."""
-    cards = [deepcopy(card) for card in state.get("evidence_cards", [])]
+    cards = [normalize_source(card) for card in state.get("evidence_cards", [])]
     if not cards:
         return {
             **_empty_verification_result("검증할 근거 카드가 없습니다."),
@@ -747,12 +787,8 @@ def evidence_verification_agent(state: GlobalState) -> dict[str, Any]:
         }
     )
     verification_result = graph_result["verification_result"]
-    verified_cards = verification_result["payload"].get(
-        "verified_evidence_cards", []
-    )
-    partial_cards = verification_result["payload"].get(
-        "partially_verified_cards", []
-    )
+    verified_cards = verification_result["payload"].get("verified_evidence_cards", [])
+    partial_cards = verification_result["payload"].get("partially_verified_cards", [])
     return {
         "verification_result": verification_result,
         "verified_evidence_cards": deepcopy(verified_cards),

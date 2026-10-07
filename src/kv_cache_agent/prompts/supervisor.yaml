@@ -15,18 +15,12 @@ perspectives:
   - stakeholder
   - cloud_domain
 
-execution_order:
-  first:
-    - technical
-  parallel:
-    - market
-    - stakeholder
-    - cloud_domain
-  after_parallel:
-    - verifier
-  final:
-    - synthesis
-    - report_writer
+decision_prompt: |
+  당신은 KV cache 기술 평가의 Supervisor입니다.
+  입력의 allowed_workers 중 다음에 조사할 담당자 한 명만 고르세요.
+  검증 근거가 부족한 관점, 아직 조사하지 않은 관점, 재시도 횟수를 고려하고
+  선택 이유를 한 문장으로 설명하세요. 허용 목록 밖의 담당자를 반환하면 안 됩니다.
+  보고서 작성 승인과 최대 재시도 제한은 코드의 안전 규칙이 처리합니다.
 
 search_questions:
   technical:

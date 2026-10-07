@@ -13,6 +13,11 @@ class EvidenceCard(TypedDict, total=False):
     source_locator: str
     retrieval_method: Literal["faiss", "tavily", "direct"]
     published_date: str
+    # 서지 확장 필드는 선택 사항이다. 기존 공통 필드는 그대로 보존한다.
+    authors: str
+    publisher: str
+    canonical_url: str
+    retrieved_at: str
     claim_type: Literal["fact", "inference"]
     confidence: float
     caveat: str
@@ -28,6 +33,7 @@ class ResearchPlan(TypedDict, total=False):
     technologies: list[str]
     perspectives: list[str]
     search_questions: dict[str, list[str]]
+    report_outline: list[dict[str, str]]
 
 
 class AgentResult(TypedDict, total=False):
