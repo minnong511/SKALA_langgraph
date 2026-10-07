@@ -12,6 +12,7 @@ from kv_cache_agent.agents.synthesis import synthesis_agent
 from kv_cache_agent.agents.technical import technical_research_agent
 from kv_cache_agent.agents.verifier import evidence_verification_agent
 from kv_cache_agent.graph.state import GlobalState
+from kv_cache_agent.observability.nodes import add_logged_node
 
 
 def build_workflow(
@@ -24,15 +25,15 @@ def build_workflow(
     """
     graph = StateGraph(GlobalState)
 
-    graph.add_node("supervisor", supervisor_agent)
+    add_logged_node(graph, "supervisor", supervisor_agent)
     # 테스트에서는 실제 BGE-M3를 로드하지 않도록 기술 노드를 주입할 수 있다.
-    graph.add_node("technical", technical_node or technical_research_agent)
-    graph.add_node("market", market_evaluation_agent)
-    graph.add_node("stakeholder", stakeholder_evaluation_agent)
-    graph.add_node("cloud_domain", cloud_domain_agent)
-    graph.add_node("verifier", evidence_verification_agent)
-    graph.add_node("synthesis", synthesis_agent)
-    graph.add_node("report_writer", report_writer_agent)
+    add_logged_node(graph, "technical", technical_node or technical_research_agent)
+    add_logged_node(graph, "market", market_evaluation_agent)
+    add_logged_node(graph, "stakeholder", stakeholder_evaluation_agent)
+    add_logged_node(graph, "cloud_domain", cloud_domain_agent)
+    add_logged_node(graph, "verifier", evidence_verification_agent)
+    add_logged_node(graph, "synthesis", synthesis_agent)
+    add_logged_node(graph, "report_writer", report_writer_agent)
 
     graph.add_edge(START, "supervisor")
     graph.add_edge("supervisor", "technical")

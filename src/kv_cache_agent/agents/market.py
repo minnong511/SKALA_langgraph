@@ -10,8 +10,8 @@ from urllib.parse import urlparse
 from langgraph.graph import END, START, StateGraph
 
 from kv_cache_agent.graph.state import GlobalState
+from kv_cache_agent.observability.nodes import add_logged_node
 from kv_cache_agent.tools import tavily_search as tavily_tool
-
 
 MAX_TAVILY_QUERIES = 3
 MAX_RESULTS_PER_QUERY = 3
@@ -304,7 +304,7 @@ def _normalize_result(raw_result: Any, query: str) -> dict[str, Any] | None:
     if not url or not content:
         return None
 
-    combined_text = " ".join((query, title, content))
+    combined_text = f"{query} {title} {content}"
     claim = str(result.get("claim") or _first_sentence(content)).strip()
     evidence_text = str(result.get("evidence_text") or content).strip()[:2000]
     technology = _technology_from_text(
@@ -643,15 +643,15 @@ def _finalize_market_result(state: MarketLocalState) -> MarketLocalState:
 def _build_market_graph():
     """시장 평가 Agent 내부의 LangGraph를 생성한다."""
     graph = StateGraph(MarketLocalState)
-    graph.add_node("generate_questions", _generate_market_questions)
-    graph.add_node("search", _search_market_sources)
-    graph.add_node("collect_urls", _collect_source_urls)
-    graph.add_node("extract_sources", _extract_source_information)
-    graph.add_node("build_cards", _write_market_evidence_cards)
-    graph.add_node("check_sufficiency", _check_market_sufficiency)
-    graph.add_node("supplement_queries", _supplement_market_queries)
-    graph.add_node("mark_insufficient", _mark_insufficient_market_evidence)
-    graph.add_node("finalize", _finalize_market_result)
+    add_logged_node(graph, "generate_questions", _generate_market_questions)
+    add_logged_node(graph, "search", _search_market_sources)
+    add_logged_node(graph, "collect_urls", _collect_source_urls)
+    add_logged_node(graph, "extract_sources", _extract_source_information)
+    add_logged_node(graph, "build_cards", _write_market_evidence_cards)
+    add_logged_node(graph, "check_sufficiency", _check_market_sufficiency)
+    add_logged_node(graph, "supplement_queries", _supplement_market_queries)
+    add_logged_node(graph, "mark_insufficient", _mark_insufficient_market_evidence)
+    add_logged_node(graph, "finalize", _finalize_market_result)
 
     graph.add_edge(START, "generate_questions")
     graph.add_edge("generate_questions", "search")

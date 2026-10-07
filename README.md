@@ -292,7 +292,7 @@ uv run python -m kv_cache_agent.rag.ingest_papers
 uv run python -m kv_cache_agent.main
 ```
 
-> **현재 명령의 수행 범위:** 그래프 생성 및 초기화 메시지 출력까지 수행. 전체 조사 실행과 보고서 파일 저장은 별도 호출 구현 필요.
+> **현재 명령의 수행 범위:** 기존 전체 조사 그래프를 실행하고 Markdown·PDF·최종 결과 로그를 저장한다. 리팩토링 1~5단계에서는 모든 노드의 실시간 이벤트와 LangSmith 추적 기반을 추가했다. 동적 5개 에이전트 구조의 이관은 6단계 이후 진행한다.
 > **그래프에 구성된 처리 흐름**
 
 ```text
@@ -344,3 +344,14 @@ uv run pytest -q
 | 윤시은 | 시장 평가, 이해관계자 평가      | 시장 및 채택 현황 조사, 관계자별 반응과 도입 조건 분석 구현        |
 | 주연수 | 클라우드 도메인 평가, 근거 검증 | 클라우드 적용성 평가, 출처 및 주장 검증 구현                       |
 | 이민형 | 평가 종합, 보고서 생성          | 관점별 결과의 일치와 상충 분석, YAML 기반 종합 및 보고서 생성 구현 |
+
+## 리팩토링 1~5단계 기반 기능
+
+- 공통 데이터 계약과 원문·실제 초안 주장 검증: `schemas/`, `verification/`.
+- 기본 웹 원문 수집은 Tavily Extract를 사용한다. 검색 요약과 추출 본문을 구분한다.
+- 실행별 진행 이벤트: `outputs/logs/<run_id>/events.jsonl`, 종료 요약: 같은 경로의 `summary.json`.
+- 로그 수준은 `--log-level INFO` 또는 `LOG_LEVEL`로 설정한다.
+- LangSmith 설정은 `.env.example`의 `LANGSMITH_*` 항목을 사용한다. 추적 활성 시 API 키와 프로젝트가 필요하다.
+- 오프라인 테스트에서는 `LANGSMITH_TRACING=false`를 설정한다.
+- 기존 전체 CLI의 최종 상태·종료 코드 이관은 12단계다. 새 실행 이벤트 요약과 기존 aggregate 로그를 구분한다.
+- 구현·검증·남은 회귀 사례: [단계별 기록](docs/refactor_stages_1_5.md).

@@ -4,8 +4,9 @@ import traceback
 from datetime import UTC, datetime
 from pathlib import Path
 
-from kv_cache_agent.config import OUTPUTS_DIR
+from kv_cache_agent.config import LOG_LEVEL, OUTPUTS_DIR
 from kv_cache_agent.graph.workflow import build_workflow
+from kv_cache_agent.observability.logger import RunSession
 from kv_cache_agent.tools.pdf_writer import write_pdf
 
 DEFAULT_QUERY = (
@@ -27,6 +28,7 @@ def main() -> None:
         default=None,
         help="상세 실행 로그 경로. 생략하면 outputs/logs에 자동 저장합니다.",
     )
+    parser.add_argument("--log-level", choices=["DEBUG", "INFO", "WARNING", "ERROR"], default=LOG_LEVEL)
     args = parser.parse_args()
     query = args.query.strip() or DEFAULT_QUERY
 
@@ -35,7 +37,14 @@ def main() -> None:
     log_path.parent.mkdir(parents=True, exist_ok=True)
 
     try:
-        result = build_workflow().invoke({"user_query": query})
+        with RunSession(OUTPUTS_DIR / "logs", log_level=args.log_level,
+                        metadata={"workflow_version": "legacy-foundation"}) as session:
+            result = build_workflow().invoke(
+                {"user_query": query}, config={"metadata": {"application_run_id": session.run_id}}
+            )
+            failed = result.get("synthesis_result", {}).get("status") == "failed" or result.get("final_report", "").startswith("# 보고서 생성 실패")
+            outcome = "failed" if failed else "provisional" if result.get("verification_result", {}).get("status") != "ok" else "completed"
+            session.finish(outcome, report_length=len(result.get("final_report", "")))
     except Exception as error:
         log_path.write_text(
             json.dumps(

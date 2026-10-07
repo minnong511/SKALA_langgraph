@@ -10,6 +10,7 @@ from pydantic import BaseModel, Field
 
 from kv_cache_agent.graph.state import GlobalState
 from kv_cache_agent.llm import get_llm
+from kv_cache_agent.observability.nodes import add_logged_node
 from kv_cache_agent.schemas.outputs import EvidenceCard
 from kv_cache_agent.schemas.tool_outputs import WebSearchResult
 from kv_cache_agent.tools.paper_retriever import retrieve_paper_chunks
@@ -880,16 +881,16 @@ def build_cloud_domain_graph():
     graph = StateGraph(CloudDomainGraphState)
 
     # 도식의 사각형 단계를 각각 독립 노드로 등록한다.
-    graph.add_node("generate_scenarios", _generate_cloud_scenarios_node)  # B
-    graph.add_node("generate_search_queries", _generate_search_queries_node)  # C
-    graph.add_node("retrieve_sources", _retrieve_sources_node)  # D
-    graph.add_node("extract_related_evidence", _extract_related_evidence_node)  # E
-    graph.add_node("evaluate_domain_fit", _evaluate_domain_fit_node)  # F
-    graph.add_node("check_scenario_coverage", _check_scenario_coverage_node)  # G
-    graph.add_node("prepare_retry", _prepare_retry_node)  # H
-    graph.add_node("check_retry_available", _check_retry_available_node)  # I
-    graph.add_node("record_limitations", _record_limitations_node)  # J
-    graph.add_node("return_domain_result", _return_domain_result_node)  # K
+    add_logged_node(graph, "generate_scenarios", _generate_cloud_scenarios_node)  # B
+    add_logged_node(graph, "generate_search_queries", _generate_search_queries_node)  # C
+    add_logged_node(graph, "retrieve_sources", _retrieve_sources_node)  # D
+    add_logged_node(graph, "extract_related_evidence", _extract_related_evidence_node)  # E
+    add_logged_node(graph, "evaluate_domain_fit", _evaluate_domain_fit_node)  # F
+    add_logged_node(graph, "check_scenario_coverage", _check_scenario_coverage_node)  # G
+    add_logged_node(graph, "prepare_retry", _prepare_retry_node)  # H
+    add_logged_node(graph, "check_retry_available", _check_retry_available_node)  # I
+    add_logged_node(graph, "record_limitations", _record_limitations_node)  # J
+    add_logged_node(graph, "return_domain_result", _return_domain_result_node)  # K
 
     graph.add_edge(START, "generate_scenarios")
     graph.add_edge("generate_scenarios", "generate_search_queries")

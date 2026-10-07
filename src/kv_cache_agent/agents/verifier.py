@@ -8,17 +8,16 @@ from typing import Any, Literal, TypedDict
 from urllib.parse import urlparse
 
 import yaml
-from langchain_core.messages import HumanMessage, SystemMessage
 from langgraph.graph import END, START, StateGraph
 from pydantic import BaseModel, Field
-from pypdf import PdfReader
 
 from kv_cache_agent.config import ROOT_DIR
 from kv_cache_agent.graph.state import GlobalState
-from kv_cache_agent.llm import get_llm
+from kv_cache_agent.observability.nodes import add_logged_node
 from kv_cache_agent.schemas.outputs import EvidenceCard
 from kv_cache_agent.schemas.tool_outputs import FetchedSource
 from kv_cache_agent.tools.source_fetcher import fetch_source
+from kv_cache_agent.verification.sources import classify_source, read_pdf_pages
 
 PROMPT_PATH = Path(__file__).resolve().parents[1] / "prompts" / "verifier.yaml"
 MAX_RETRIES = 1
@@ -118,21 +117,7 @@ def _validate_card_metadata(card: EvidenceCard) -> list[str]:
 
 def _extract_pdf_pages(path: Path, source_locator: str) -> str:
     """논문 locator의 페이지를 우선 읽고 없으면 PDF 전체에서 일부를 읽는다."""
-    reader = PdfReader(str(path))
-    page_numbers = [int(number) for number in re.findall(r"\d+", source_locator)]
-    if page_numbers:
-        start = max(page_numbers[0] - 1, 0)
-        end = min((page_numbers[-1] if len(page_numbers) > 1 else start + 1), len(reader.pages))
-        selected_indexes = range(start, max(start + 1, end))
-    else:
-        selected_indexes = range(min(3, len(reader.pages)))
-
-    page_texts = [
-        (reader.pages[index].extract_text() or "").strip()
-        for index in selected_indexes
-        if 0 <= index < len(reader.pages)
-    ]
-    return "\n\n".join(text for text in page_texts if text)[:30_000]
+    return read_pdf_pages(path, source_locator)
 
 
 def _fetch_original_source(card: EvidenceCard) -> FetchedSource:
@@ -225,25 +210,47 @@ def _compare_claims_with_sources(
     sources: dict[str, FetchedSource],
 ) -> ClaimComparisonBatch:
     """D 단계에서 주장과 원문을 구조화 출력으로 비교한다."""
-    llm = get_llm().with_structured_output(ClaimComparisonBatch)
-    prompt = (
-        "아래 EvidenceCard의 주장과 재확인한 원문을 비교하라.\n"
-        "주장을 원문이 직접 뒷받침하면 full, 일부 조건이나 범위만 뒷받침하면 "
-        "partial, 뒷받침하지 않으면 none으로 판정하라.\n"
-        "원문이 직접 말하지 않은 해석을 fact로 표시했다면 "
-        "claim_type_assessment를 should_be_inference로 판정하라.\n"
-        "각 evidence_id를 빠짐없이 그대로 반환하라.\n\n"
-        f"검증 입력:\n{_build_comparison_context(cards, sources)}"
-    )
-    response = llm.invoke(
-        [
-            SystemMessage(content=_load_system_prompt()),
-            HumanMessage(content=prompt),
-        ]
-    )
-    if isinstance(response, ClaimComparisonBatch):
-        return response
-    return ClaimComparisonBatch.model_validate(response)
+    from kv_cache_agent.schemas.base import stable_id
+    from kv_cache_agent.schemas.evidence import EvidenceCard as EvidenceRecord
+    from kv_cache_agent.schemas.evidence import SourceRef, SourceSnapshot
+    from kv_cache_agent.schemas.research import legacy_claim
+    from kv_cache_agent.verification.pipeline import VerificationPipeline
+
+    records = []
+    claims = []
+    snapshots = {}
+    for card in cards:
+        evidence_id = str(card["evidence_id"])
+        location = str(card["source_url"])
+        reference = SourceRef(
+            source_id=stable_id("legacy-source", {"id": evidence_id, "location": location}),
+            location=location, title=str(card.get("source_title", "")),
+            source_type=classify_source(location), locator=str(card.get("source_locator", "")),
+            published_date=str(card.get("published_date", "")) or None,
+        )
+        records.append(EvidenceRecord(
+            evidence_id=evidence_id, technology=card["technology"], perspective=card["perspective"],
+            criterion="legacy", claim=card["claim"], evidence_text=card["evidence_text"],
+            source_refs=(reference,), claim_type=card["claim_type"],
+        ))
+        claims.append(legacy_claim(card))
+        fetched = sources.get(evidence_id, {})
+        content = str(fetched.get("content", ""))
+        excerpt = "source=tavily" in str(fetched.get("content_type", ""))
+        snapshots[reference.source_id] = SourceSnapshot(
+            reference=reference, content=content,
+            acquisition="search_excerpt" if excerpt else "local_pdf" if fetched.get("source_type") == "pdf" else "tavily_extract",
+            status="ok" if content and (fetched.get("fetch_status") == "ok" or excerpt) else "error",
+            error=str(fetched.get("error", "")),
+            truncated=bool(fetched.get("content_truncated", False)),
+        )
+    result = VerificationPipeline(loader=lambda ref: snapshots[ref.source_id]).verify(claims, records)
+    return ClaimComparisonBatch(decisions=[ClaimEvidenceDecision(
+        evidence_id=d.claim_id,
+        support_level="full" if d.status == "verified" else "partial" if d.status == "partially_verified" else "none",
+        matched_text=d.matched_text, rationale="; ".join([d.rationale, *d.issues]),
+        claim_type_assessment=d.claim_type_assessment,
+    ) for d in result.decisions])
 
 
 def _parse_published_date(value: str) -> date | None:
@@ -265,7 +272,7 @@ def _parse_published_date(value: str) -> date | None:
 
 def _source_quality(card: EvidenceCard) -> dict[str, Any]:
     """E 단계에서 출처 유형과 발행일을 기준으로 품질·최신성을 평가한다."""
-    source_type = card.get("source_type")
+    source_type = classify_source(str(card.get("source_url", "")))
     quality = {
         "paper": "high",
         "official": "high",
@@ -316,17 +323,18 @@ def _recheck_original_sources_node(
     limitations = list(state.get("limitations", []))
     errors = list(state.get("errors", []))
     tavily_fallback_ids = list(state.get("tavily_fallback_ids", []))
-    source_cache: dict[str, FetchedSource] = {}
+    source_cache: dict[tuple[str, str], FetchedSource] = {}
 
     for index, card in enumerate(cards, start=1):
         evidence_id = _card_id(card, index)
         if evidence_id not in active_ids:
             continue
         source_url = str(card.get("source_url", "")).strip()
-        source = source_cache.get(source_url)
+        cache_key = (source_url, str(card.get("source_locator", "")))
+        source = source_cache.get(cache_key)
         if source is None:
             source = _fetch_original_source(card)
-            source_cache[source_url] = source
+            source_cache[cache_key] = source
         sources[evidence_id] = source
         if source.get("fetch_status") == "blocked":
             fallback_content = str(card.get("evidence_text", "")).strip()
@@ -380,7 +388,7 @@ def _compare_claim_and_evidence_node(
             .get("content")
         )
     ]
-    decisions = dict(state.get("decisions", {}))
+    decisions = {key: value for key, value in state.get("decisions", {}).items() if key not in active_ids}
     errors = list(state.get("errors", []))
 
     if active_cards:
@@ -645,17 +653,17 @@ def build_evidence_verification_graph():
     """고정된 B~L 검증 도식을 LangGraph 서브그래프로 구성한다."""
     graph = StateGraph(VerificationGraphState)
 
-    graph.add_node("check_source_metadata", _check_source_metadata_node)  # B
-    graph.add_node("recheck_original_sources", _recheck_original_sources_node)  # C
-    graph.add_node("compare_claim_and_evidence", _compare_claim_and_evidence_node)  # D
-    graph.add_node("evaluate_source_quality", _evaluate_source_quality_node)  # E
-    graph.add_node("classify_fact_and_inference", _classify_fact_and_inference_node)  # F
-    graph.add_node("check_comparison_balance", _check_comparison_balance_node)  # G
-    graph.add_node("check_verification_pass", _check_verification_pass_node)  # H
-    graph.add_node("request_revision", _request_revision_node)  # I
-    graph.add_node("check_reverification_available", _check_reverification_available_node)  # J
-    graph.add_node("mark_uncertainty", _mark_uncertainty_node)  # K
-    graph.add_node("return_verified_result", _return_verified_result_node)  # L
+    add_logged_node(graph, "check_source_metadata", _check_source_metadata_node)  # B
+    add_logged_node(graph, "recheck_original_sources", _recheck_original_sources_node)  # C
+    add_logged_node(graph, "compare_claim_and_evidence", _compare_claim_and_evidence_node)  # D
+    add_logged_node(graph, "evaluate_source_quality", _evaluate_source_quality_node)  # E
+    add_logged_node(graph, "classify_fact_and_inference", _classify_fact_and_inference_node)  # F
+    add_logged_node(graph, "check_comparison_balance", _check_comparison_balance_node)  # G
+    add_logged_node(graph, "check_verification_pass", _check_verification_pass_node)  # H
+    add_logged_node(graph, "request_revision", _request_revision_node)  # I
+    add_logged_node(graph, "check_reverification_available", _check_reverification_available_node)  # J
+    add_logged_node(graph, "mark_uncertainty", _mark_uncertainty_node)  # K
+    add_logged_node(graph, "return_verified_result", _return_verified_result_node)  # L
 
     graph.add_edge(START, "check_source_metadata")
     graph.add_edge("check_source_metadata", "recheck_original_sources")

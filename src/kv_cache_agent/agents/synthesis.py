@@ -79,6 +79,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from kv_cache_agent.graph.state import GlobalState
 from kv_cache_agent.llm import get_llm
+from kv_cache_agent.observability.nodes import add_logged_node
 
 PROMPT_PATH = Path(__file__).resolve().parents[1] / "prompts" / "synthesis.yaml"
 PERSPECTIVES = ("technical", "market", "stakeholder", "cloud_domain")
@@ -560,14 +561,14 @@ def _synthesis_failure(local: SynthesisState) -> dict:
 def build_synthesis_graph():
     """내부 StateGraph 컴파일. 실행 상태는 invoke마다 분리, 체크포인터 없음."""
     graph = StateGraph(SynthesisState)
-    graph.add_node("load_config", _load_synthesis_config)
-    graph.add_node("prepare_context", _prepare_context)
-    graph.add_node("generate", _generate_synthesis)
-    graph.add_node("validate", _validate_synthesis)
-    graph.add_node("build_result", _build_result)
-    graph.add_node("insufficient", _insufficient_result)
-    graph.add_node("insufficient_after_validation", _insufficient_after_validation)
-    graph.add_node("failure", _synthesis_failure)
+    add_logged_node(graph, "load_config", _load_synthesis_config)
+    add_logged_node(graph, "prepare_context", _prepare_context)
+    add_logged_node(graph, "generate", _generate_synthesis)
+    add_logged_node(graph, "validate", _validate_synthesis)
+    add_logged_node(graph, "build_result", _build_result)
+    add_logged_node(graph, "insufficient", _insufficient_result)
+    add_logged_node(graph, "insufficient_after_validation", _insufficient_after_validation)
+    add_logged_node(graph, "failure", _synthesis_failure)
     graph.add_edge(START, "load_config")
     graph.add_conditional_edges(
         "load_config", _route_error, {"next": "prepare_context", "error": "failure"}

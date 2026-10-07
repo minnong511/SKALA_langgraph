@@ -43,3 +43,21 @@ class GlobalState(TypedDict, total=False):
     verification_result: AgentResult
     synthesis_result: AgentResult
     final_report: str
+
+
+# Foundation channels are additive until the five worker agents migrate in stages 6–10.
+from kv_cache_agent.schemas.evidence import EvidenceCard as EvidenceRecord
+from kv_cache_agent.schemas.evidence import VerificationDecision
+from kv_cache_agent.schemas.report import ReportPlan, SectionDraft
+from kv_cache_agent.schemas.research import CoverageItem, TaskResult, merge_versioned
+
+
+class FoundationState(TypedDict, total=False):
+    report_plan: ReportPlan
+    task_results: Annotated[dict[str, TaskResult], merge_versioned]
+    evidence_by_id: Annotated[dict[str, EvidenceRecord], merge_versioned]
+    drafts_by_section: Annotated[dict[str, SectionDraft], merge_versioned]
+    verification_decisions: dict[str, VerificationDecision]
+    coverage: list[CoverageItem]
+    active_task_ids: list[str]
+    budget_usage: dict[str, int]

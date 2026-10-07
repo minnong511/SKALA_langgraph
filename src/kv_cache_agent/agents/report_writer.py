@@ -81,6 +81,7 @@ from kv_cache_agent.agents.synthesis import (
 )
 from kv_cache_agent.graph.state import GlobalState
 from kv_cache_agent.llm import get_llm
+from kv_cache_agent.observability.nodes import add_logged_node
 
 PROMPT_PATH = Path(__file__).resolve().parents[1] / "prompts" / "report_writer.yaml"
 TITLES = [
@@ -711,14 +712,14 @@ def _report_failure(local: ReportState) -> dict:
 def build_report_graph():
     """생성, 인용 검사, 렌더링, 최종 검사를 분리한 LangGraph 구성."""
     graph = StateGraph(ReportState)
-    graph.add_node("load_config", _load_report_config)
-    graph.add_node("prepare_context", _prepare_report_context)
-    graph.add_node("generate", _generate_sections)
-    graph.add_node("validate_sections", _validate_sections)
-    graph.add_node("render", _render_report)
-    graph.add_node("validate_report", _validate_report)
-    graph.add_node("fallback", _build_fallback_report)
-    graph.add_node("failure", _report_failure)
+    add_logged_node(graph, "load_config", _load_report_config)
+    add_logged_node(graph, "prepare_context", _prepare_report_context)
+    add_logged_node(graph, "generate", _generate_sections)
+    add_logged_node(graph, "validate_sections", _validate_sections)
+    add_logged_node(graph, "render", _render_report)
+    add_logged_node(graph, "validate_report", _validate_report)
+    add_logged_node(graph, "fallback", _build_fallback_report)
+    add_logged_node(graph, "failure", _report_failure)
     graph.add_edge(START, "load_config")
     graph.add_conditional_edges(
         "prepare_context",

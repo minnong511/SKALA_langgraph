@@ -6,6 +6,8 @@ from typing import Any, Literal
 from tavily import TavilyClient
 
 from kv_cache_agent.config import TAVILY_API_KEY
+from kv_cache_agent.observability.logger import emit
+from kv_cache_agent.observability.tracing import traced_tool
 from kv_cache_agent.schemas.tool_outputs import WebSearchResult
 
 SearchTopic = Literal["general", "news", "finance"]
@@ -63,6 +65,7 @@ def normalize_search_results(
     return normalized
 
 
+@traced_tool("tavily.search")
 def search_web(
     query: str,
     *,
@@ -107,9 +110,13 @@ def search_web(
     if clean_excluded_domains:
         search_kwargs["exclude_domains"] = clean_excluded_domains
 
+    emit("tool_start", message="Tavily 검색", details={"query": clean_query, "max_results": max_results})
     try:
         response = search_client.search(**search_kwargs)
     except Exception as error:
+        emit("tool_error", level="WARNING", message=type(error).__name__)
         raise TavilySearchError(f"Tavily 검색에 실패했습니다: {error}") from error
 
-    return normalize_search_results(response, topic=topic)
+    results = normalize_search_results(response, topic=topic)
+    emit("tool_end", details={"result_count": len(results), "query": clean_query})
+    return results

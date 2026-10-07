@@ -72,7 +72,7 @@ def _is_pdf(content_type: str, url: str) -> bool:
     return "application/pdf" in content_type.lower() or path.endswith(".pdf")
 
 
-def fetch_source(
+def _fetch_source_http(
     url: str,
     *,
     max_chars: int = DEFAULT_MAX_CHARS,
@@ -160,7 +160,7 @@ def fetch_source(
             clean_url,
             f"원문 수집에 실패했습니다: {error}",
         )
-    except Exception as error:  # noqa: BLE001
+    except Exception as error:  # noqa: BLE001 - external boundary returns explicit failure  # noqa: BLE001
         return _error_result(
             clean_url,
             f"원문 파싱에 실패했습니다: {error}",
@@ -168,3 +168,26 @@ def fetch_source(
     finally:
         if owns_client:
             http_client.close()
+
+
+def fetch_source(url: str, *, max_chars: int = DEFAULT_MAX_CHARS, timeout: float = DEFAULT_TIMEOUT, client: httpx.Client | None = None) -> FetchedSource:
+    """Production web reads use Tavily Extract; injected HTTP clients remain a test adapter."""
+    if client is not None:
+        return _fetch_source_http(url, max_chars=max_chars, timeout=timeout, client=client)
+    if max_chars < 1 or timeout <= 0:
+        raise ValueError("Invalid fetch limits")
+    from kv_cache_agent.tools.tavily_extract import web_fetch
+    try:
+        snapshot = web_fetch(url)
+    except Exception as error:  # noqa: BLE001 - external boundary returns explicit failure
+        return _error_result(url, f"{type(error).__name__}: {error}")
+    content = snapshot.content[:max_chars]
+    return {
+        "title": snapshot.reference.title or url, "url": snapshot.reference.location,
+        "content": content, "source_type": "web", "published_date": "",
+        "content_length": len(content), "status_code": 0,
+        "content_type": "text/markdown", "fetch_status": snapshot.status,
+        "error": snapshot.error, "retrieval_method": "tavily_extract",
+        "content_hash": snapshot.content_hash,
+        "content_truncated": len(snapshot.content) > max_chars,
+    }

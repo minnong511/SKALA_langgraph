@@ -10,8 +10,8 @@ from urllib.parse import urlparse
 from langgraph.graph import END, START, StateGraph
 
 from kv_cache_agent.graph.state import GlobalState
+from kv_cache_agent.observability.nodes import add_logged_node
 from kv_cache_agent.tools import tavily_search as tavily_tool
-
 
 MAX_TAVILY_QUERIES = 3
 MAX_RESULTS_PER_QUERY = 3
@@ -366,14 +366,14 @@ def _normalize_result(raw_result: Any, query: str) -> dict[str, Any] | None:
     if not stakeholders:
         # 검색어에는 여러 이해관계자 유형이 함께 들어갈 수 있으므로,
         # 검색어만으로 유형을 부여하면 근거 본문과 무관한 분류가 생긴다.
-        stakeholders = _stakeholders_from_text(" ".join((title, content)))
+        stakeholders = _stakeholders_from_text(f"{title} {content}")
 
     if not stakeholders:
         return None
 
     claim = str(result.get("claim") or _first_sentence(content)).strip()
     evidence_text = str(result.get("evidence_text") or content).strip()[:2000]
-    combined_text = " ".join((query, title, content))
+    combined_text = f"{query} {title} {content}"
     return {
         "title": title or url,
         "url": url,
@@ -696,14 +696,14 @@ def _finalize_stakeholder_result(
 def _build_stakeholder_graph():
     """이해관계자 평가 Agent 내부의 LangGraph를 생성한다."""
     graph = StateGraph(StakeholderLocalState)
-    graph.add_node("generate_stakeholders", _generate_stakeholder_list)
-    graph.add_node("search", _search_stakeholder_sources)
-    graph.add_node("extract_sources", _extract_stakeholder_sources)
-    graph.add_node("analyze_positions", _build_stakeholder_evidence)
-    graph.add_node("check_evidence", _check_stakeholder_evidence)
-    graph.add_node("supplement_queries", _supplement_stakeholder_queries)
-    graph.add_node("mark_uncertain", _mark_uncertain_stakeholders)
-    graph.add_node("finalize", _finalize_stakeholder_result)
+    add_logged_node(graph, "generate_stakeholders", _generate_stakeholder_list)
+    add_logged_node(graph, "search", _search_stakeholder_sources)
+    add_logged_node(graph, "extract_sources", _extract_stakeholder_sources)
+    add_logged_node(graph, "analyze_positions", _build_stakeholder_evidence)
+    add_logged_node(graph, "check_evidence", _check_stakeholder_evidence)
+    add_logged_node(graph, "supplement_queries", _supplement_stakeholder_queries)
+    add_logged_node(graph, "mark_uncertain", _mark_uncertain_stakeholders)
+    add_logged_node(graph, "finalize", _finalize_stakeholder_result)
 
     graph.add_edge(START, "generate_stakeholders")
     graph.add_edge("generate_stakeholders", "search")
