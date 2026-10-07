@@ -1,7 +1,7 @@
 [project]
 name = "kv-cache-sw-vs-hw"
 version = "0.1.0"
-description = "Supervisor-based Agentic RAG for multi-perspective KV Cache evaluation"
+description = "Orchestrator-Workers Agentic RAG for multi-perspective KV Cache evaluation"
 readme = "README.md"
 requires-python = ">=3.11,<3.12"
 dependencies = [
@@ -15,6 +15,7 @@ dependencies = [
     "langchain-openai>=0.3.0",
     "langchain-text-splitters>=0.3.0",
     "langgraph>=0.3.0",
+    "langsmith>=0.3.0",
     "pydantic>=2.0.0",
     "pypdf>=5.0.0",
     "python-dotenv>=1.0.0",
@@ -23,6 +24,9 @@ dependencies = [
     "tavily-python>=0.5.0",
     "reportlab>=5.0.1",
 ]
+
+[project.optional-dependencies]
+recovery = ["langgraph-checkpoint-sqlite>=2.0.0"]
 
 [dependency-groups]
 dev = [

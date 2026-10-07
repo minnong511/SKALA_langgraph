@@ -8,8 +8,9 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from langgraph.graph import END, START, StateGraph
 from pydantic import BaseModel, Field
 
-from kv_cache_agent.graph.state import GlobalState
+from kv_cache_agent.graph.state import LegacyState as GlobalState
 from kv_cache_agent.llm import get_llm
+from kv_cache_agent.schemas.measurement import MeasurementFields, measurement_fields
 from kv_cache_agent.schemas.outputs import EvidenceCard
 from kv_cache_agent.schemas.tool_outputs import WebSearchResult
 from kv_cache_agent.tools.paper_retriever import retrieve_paper_chunks
@@ -76,10 +77,7 @@ DEFAULT_CLOUD_QUERIES = [
         "TurboQuant KV cache quantization cloud LLM inference "
         "GPU memory latency throughput"
     ),
-    (
-        "CXL based KV cache cloud LLM inference long context "
-        "latency throughput"
-    ),
+    ("CXL based KV cache cloud LLM inference long context latency throughput"),
 ]
 
 Technology = Literal["TurboQuant", "CXL-based", "both", "general"]
@@ -96,7 +94,7 @@ CloudCriterion = Literal[
 ]
 
 
-class CloudDomainFinding(BaseModel):
+class CloudDomainFinding(MeasurementFields):
     """LLM이 반환하는 클라우드 평가 주장 한 건의 구조."""
 
     technology: Technology
@@ -334,9 +332,7 @@ def _build_source_context(
 
     for chunk in vector_chunks:
         metadata = chunk.get("metadata", {})
-        source_url = str(
-            metadata.get("source_url") or metadata.get("source_path", "")
-        )
+        source_url = str(metadata.get("source_url") or metadata.get("source_path", ""))
         context_parts.append(
             "\n".join(
                 [
@@ -365,8 +361,7 @@ def _extract_cloud_assessment(
     coverage_instruction = ""
     if required_coverage:
         coverage_text = ", ".join(
-            f"{technology}:{criterion}"
-            for technology, criterion in required_coverage
+            f"{technology}:{criterion}" for technology, criterion in required_coverage
         )
         coverage_instruction = (
             "\n이번 재평가에서는 다음 기술·시나리오의 누락 근거를 우선 보완하라: "
@@ -387,9 +382,18 @@ def _extract_cloud_assessment(
         "사용 가능한 근거:\n"
         f"{_build_source_context(technical_cards, web_results, vector_chunks)}"
     )
+    if state.get("task_instruction"):
+        prompt = (
+            f"배정된 Task와 도메인: {state.get('user_query', '')}\n"
+            "해당 Task의 목표에 관련된 시나리오만 평가한다. 다른 Task의 작업을 반복하지 않는다.\n"
+            "제공된 출처 URL과 논문 source_locator만 인용하고 사실과 추론을 구분한다.\n"
+            f"사용 가능한 근거:\n{_build_source_context(technical_cards, web_results, vector_chunks)}"
+        )
     response = llm.invoke(
         [
-            SystemMessage(content=_load_system_prompt()),
+            SystemMessage(
+                content=state.get("task_instruction") or _load_system_prompt()
+            ),
             HumanMessage(content=prompt),
         ]
     )
@@ -497,6 +501,7 @@ def _build_evidence_cards(
                 "confidence": finding.confidence,
                 "caveat": finding.caveat,
                 "verification_status": "unverified",
+                **measurement_fields(finding),
             }
         )
 
@@ -551,8 +556,8 @@ def _merge_evidence_cards(
             continue
         seen.add(key)
         copied_card = dict(card)
-        technology_slug = str(card.get("technology", "general")).lower().replace(
-            "-", "_"
+        technology_slug = (
+            str(card.get("technology", "general")).lower().replace("-", "_")
         )
         copied_card["evidence_id"] = (
             f"cloud-domain-{technology_slug}-{len(merged) + 1:03d}"
@@ -666,8 +671,7 @@ def _extract_related_evidence_node(
     web_results = [
         result
         for result in state.get("web_results", [])
-        if str(result.get("url", "")).strip()
-        and str(result.get("content", "")).strip()
+        if str(result.get("url", "")).strip() and str(result.get("content", "")).strip()
     ]
     vector_chunks = [
         chunk
@@ -784,9 +788,7 @@ def _prepare_retry_node(state: CloudDomainGraphState) -> dict[str, Any]:
     used_query_count = len(state.get("initial_queries", [])) + len(
         state.get("retry_queries", [])
     )
-    retry_possible = (
-        retry_count < MAX_RETRIES and used_query_count < MAX_SEARCH_QUERIES
-    )
+    retry_possible = retry_count < MAX_RETRIES and used_query_count < MAX_SEARCH_QUERIES
     if not retry_possible:
         return {"retry_possible": False}
 
@@ -819,8 +821,7 @@ def _record_limitations_node(
     missing_coverage = state.get("missing_coverage", [])
     if missing_coverage:
         missing_text = ", ".join(
-            f"{technology}:{criterion}"
-            for technology, criterion in missing_coverage
+            f"{technology}:{criterion}" for technology, criterion in missing_coverage
         )
         limitations.append(
             "최대 1회 재검색 후에도 근거가 부족한 시나리오: " + missing_text

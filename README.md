@@ -1,342 +1,413 @@
-> Subject → Overview → Selected Technologies → Features → Tech Stack → Agents → Architecture → Directory Structure → Usage → Contributors
-
-# Subject
+# KV Cache 기술 평가
 
 ## Overview
 
-SW 기반 KV cache 압축 기술인 TurboQuant와 CXL 기반 메모리 확장 시스템인 ITME를 비교·평가하는 프로젝트다.
+**Objective:** TurboQuant와 CXL-based KV Cache를 기술 성숙도, 시장성, 이해관계자, 도메인 적용성 관점에서 조사하고, 주장과 출처가 연결된 중립적인 평가 보고서를 생성한다. 기본 도메인은 클라우드 LLM 서빙이다. 특정 기술의 추천이나 승자 선정을 목표로 하지 않는다.
 
-- 적용 도메인: `클라우드 기반 LLM 서빙`
-  선정 이유: 클라우드 LLM 서빙은 SW 압축과 HW 메모리 확장 접근이 모두 적용될 수 있는 환경으로, 두 기술을 비용, 성능, 품질, 운영 조건이라는 동일한 비교하기에 적합하다.
-  논문과 공개 자료의 근거 및 적용 조건을 바탕으로 두 기술의 장점, 제약, 관점 별 평가 차이를 분석한다.
+**Pattern: Orchestrator-Workers.** Orchestrator가 사용자 질문과 현재 근거, 실패한 Task, 품질 평가를 읽고 LLM Structured Output으로 `ResearchPlan`을 만든다. 그 안의 `SubTask`마다 같은 `research_worker` 노드에 `Send`를 보내므로 Worker 수는 실행 시점에 결정된다.
 
-### 평가 관점
+기존 Fixed Flow는 `Supervisor → Technical → Market / Stakeholder / Cloud Domain → Verifier → Synthesis → Report Writer`였다. 조사 대상 노드와 기술 조사 선행 조건이 고정되고, 작성된 보고서의 품질에 따른 추가 조사 경로가 없었다. 새 흐름에서는 기술 조사도 독립 Task이며, 시장 조사나 도메인 조사가 다른 Worker의 완료를 기다리지 않는다. 필수 네 관점은 보장하되 SW/HW 구현, 상용화, 공급망 등 독립 목표에 따라 같은 관점을 여러 Task로 나눌 수 있다.
 
-1. 기술 성숙도: 기술 원리, 성능 검증 수준, 적용 범위와 한계
-2. 시장성: 시장 규모, 상용화 현황, 채택 사례와 성장 전망
-3. 이해관계자: 경쟁사, 도입 기업, 개발자, 투자 업계의 기대와 우려
-4. 도메인 적용: 클라우드 LLM 서빙에서의 성능, 비용, 운영 조건
+이 패턴은 질문마다 필요한 조사 범위가 다르고, 보고서에서 발견된 근거 부족을 선택적으로 보완해야 하는 목적에 적합하다. `supervisor.py`는 이전 단위 테스트와 비교를 위한 호환 코드로 보존하며 현재 실행 그래프에서는 사용하지 않는다.
 
-### 주요 구성
+## Selected Technologies
 
-| 구분      | 내용                                                                                                    |
-| --------- | ------------------------------------------------------------------------------------------------------- |
-| 목표      | • KV cache 압축 vs. 메모리 확장  • 기술, 시장, 이해관계자, 클라우드 적용성 비교                       |
-| 방법      | • LangGraph 기반 Multi-Agent  • Supervisor 중심 작업 조정  • 논문 검색 기반 Agentic RAG              |
-| 코드 구조 | •`src/kv_cache_agent/` 내 역할별 분리  • 에이전트, 그래프, 데이터 규격  • RAG, 도구, YAML 프롬프트 |
-| 검색 구성 | • PDF 분할 → BGE-M3 → FAISS  • 논문 및 웹 검색, 원문 수집  • 인용 확인                             |
-| 검증 구성 | • 에이전트, State, 전체 그래프 테스트  • RAG 및 웹 도구 테스트  • 샘플 입력 데이터 활용              |
+| 기술 | 평가 대상 | 유지한 논문 입력 |
+| --- | --- | --- |
+| TurboQuant | SW 기반 KV Cache 표현 압축, 품질과 계산 비용의 조건 | `data/papers/turboquant.pdf` |
+| CXL-based KV Cache | ITME를 포함한 CXL 기반 메모리 계층 확장, 이동 비용과 운영 조건 | `data/papers/cxl_based_kv_cache.pdf` |
 
-# Selected Technologies
+논문 RAG는 기술 원리와 실험 조건을 확인하고, 웹 조사는 시장과 도입 현황, 이해관계자, 적용 사례를 보완한다. 논문마다 모델, 장비, 부하가 다른 수치는 직접 우열 비교에 사용하지 않는다. PDF와 생성 인덱스는 실행 환경에서 준비해야 한다.
 
-| 구분 | 선정 기술                                          | 핵심 접근                                                                                            | 선정 이유                                                  |
-| ---- | -------------------------------------------------- | ---------------------------------------------------------------------------------------------------- | ---------------------------------------------------------- |
-| SW   | TurboQuant                                         | • KV cache 저비트 압축  • 메모리 사용량 절감  • 압축에 따른 답변 품질 영향 확인                   | 메모리 절감과 답변 품질의 균형을 평가하기 위해 선정        |
-| HW   | CXL-based 메모리 확장- 대표 논문 및 구현 사례:ITME | • CXL 메모리와 SSD 활용 용량 확장  • 정보 분산 저장, 필요 시 전송  • 데이터 이동에 따른 지연 고려 | 메모리 확장의 이점과 전송 지연의 한계를 비교하기 위해 선정 |
+## Features
 
-**공통 적용 도메인: 클라우드에서 LLM 서비스를 운영하는 환경**
+- **PDF RAG:** 기존 BGE-M3, FAISS, `paper_retriever` 유지. 청크 크기 3,500자, 중첩 500자, PDF 페이지와 청크 ID 보존.
+- **Dynamic Planning:** Pydantic `ResearchPlan`과 `SubTask`를 사용한 LLM 계획. 초기 네 관점 누락은 보완 Task로 채우고, 후속 계획은 품질 평가와 기존 근거에 반응한다.
+- **Dynamic Fan-out:** 계획에 들어 있는 pending Task마다 `langgraph.types.Send` 생성. 그래프에 관점별 Worker를 미리 등록하지 않는다.
+- **Reducer:** 병렬 Payload patch를 Task ID와 Evidence ID로 병합. 같은 결과를 재전달해도 중복을 누적하지 않는다.
+- **Worker Fall-back:** 동일 Task를 처음 실행한 뒤 최대 2회 추가 시도. 끝까지 실패하면 근거와 findings를 제외하고 한계를 기록한다. 다른 Task는 계속 처리한다.
+- **Bias Control:** 기술별 근거와 출처 분포, 상충 근거, 사실과 추론, 실험 조건 차이 점검. 단일 출처 또는 한 기술의 근거 부재는 추가 조사 대상이다.
+- **Quality Evaluation:** 보고서 뒤 독립 노드에서 필수 절, 참고문헌, 인용 연결 규칙과 LLM Judge를 함께 실행한다. Groundedness, Neutrality, Bias Control, Perspective Coverage를 모두 평가한다.
+- **Evaluation Loop:** 근거 또는 관점 부족은 계획과 Worker로, 편향은 Synthesizer로, 중립성 표현 문제는 Report Writer로 돌아간다.
+- **관측 및 복구:** 최소 JSON 이벤트, `trace_id` 상관 관계, 선택적 LangSmith Trace, 체크포인트 재개 지원.
 
-- 플랫폼 역할: 외부 소프트웨어와 하드웨어를 도입하고 연결해 LLM 서비스 제공
-- 기술 활용: TurboQuant로 메모리 사용량 절감, CXL로 사용 가능한 메모리 용량 확장
-- 비교 관점: 도입 및 운영 비용, 처리 성능, 기술과 장비의 확보 가능성, 관련 기업과 사용자의 기대 및 우려
+## Tech Stack
 
-# Features
+| 구분 | 기술 | 용도 |
+| --- | --- | --- |
+| Runtime | Python 3.11, uv, `uv.lock` | 실행 환경과 의존성 재현 |
+| Orchestration | LangGraph | StateGraph, Send, Reducer, 조건 분기, 체크포인트 |
+| LLM integration | LangChain, langchain-openai | Structured Output과 기존 검증, 종합, 보고서 생성 |
+| LLM | OpenAI, `OPENAI_MODEL` (기본 `gpt-6-luna`) | Planner, 근거 추출, 검증, 종합, 작성, Judge |
+| Retrieval | BGE-M3 (`BAAI/bge-m3`), FAISS | 기존 논문 검색. 병렬 첫 호출에서 모델과 인덱스를 공유 로드 |
+| Web | Tavily, httpx, BeautifulSoup | 검색, 원문 수집과 검증 |
+| Schemas | Pydantic, TypedDict | 실행 계약과 State 구분 |
+| Output | Markdown, ReportLab | 기존 목차와 인용을 유지하는 보고서와 한국어 PDF |
+| Observability | logging, LangSmith | 외부 이벤트와 Trace |
+| Recovery (선택) | LangGraph SQLite checkpointer | 프로세스 재시작 후 로컬 실행 복구 |
+| Validation | pytest, Ruff | 기존 기능 회귀 검사와 새 실행 경로 검증 |
 
-## 주요 기능
+## Agents
 
-- **PDF 기반 정보 추출**: TurboQuant 및 ITME 논문의 기술 원리, 실험 조건, 성능과 한계 추출
-- **논문 검색**: BGE-M3 임베딩과 FAISS 기반 관련 청크 검색
-- **웹 자료 조사**: Tavily 기반 시장 현황, 이해관계자 반응, 클라우드 적용 자료 조사
-- **다관점 병렬 평가**: 공통 기술 조사 결과를 활용한 시장, 이해관계자, 클라우드 도메인 평가 병렬 실행
-- **근거 추적**: 근거 카드 기반 주장, 출처, PDF 페이지 및 청크 ID 관리
-- **근거 검증**: 원문과 주장 대조, 출처 정보 확인, 사실과 추론 구분
-- **평가 종합**: 검증된 근거 기반 관점별 일치점, 상충점, 조건부 권고 및 불확실성 정리
-- **보고서 구성**: YAML 목차 기반 Markdown 보고서 구성 및 본문 인용과 참고문헌 연결
+| 실행 노드 | 파일 | 책임 |
+| --- | --- | --- |
+| Orchestrator | `agents/orchestrator.py` | 입력, 현재 근거, 평가 결과를 바탕으로 Task 계획 |
+| Research Worker | `agents/research_worker.py` | Task별 paper/web/hybrid 조사, 구조화 결과, 재시도 |
+| Reducer barrier | `graph/state.py`, `graph/workflow.py` | 동시 결과 병합 뒤 Task 상태와 실패 목록을 한 번 갱신 |
+| Verifier | `agents/verifier.py` | 기존 원문 대조, 사실과 추론 구분, 검증 카드 선별 |
+| Synthesizer | `agents/synthesis.py` | 기술별, 관점별 근거 통합, 조건과 불확실성 구분, 판단 → 근거 → 조건 순서의 읽기 쉬운 문장 |
+| Report Writer | `agents/report_writer.py` | 지정 목차와 인용 연결, 반복 설명 축약, 실제 PDF 페이지 검사와 제한된 분량 수정 |
+| Quality Evaluator | `agents/quality_evaluator.py` | 규칙과 LLM Judge 결합, 품질 문제와 권장 수정 경로 생성 |
 
-## 확증 편향 방지 전략
+기존 조사 파일을 삭제하지 않았다. Worker는 `technical`의 구조화 추출과 청크-근거 연결, `market`의 검색 결과 정규화와 카드 생성, `stakeholder`의 관계자 분류와 기대/우려 카드 생성, `cloud_domain`의 혼합 근거 추출과 URL 검사를 재사용한다. 기존 조사용 내부 그래프와 단위 테스트도 보존한다. Worker는 그 내부 그래프의 고정 실행 순서를 그대로 호출하지 않고 **배정된 Task의 검색어와 출처 유형**에 맞춰 helper를 사용한다.
 
-- **비교 균형 확인**: 두 기술의 유효 근거 존재 여부와 공통 평가 관점 확인 (검증 로직 반영)
-- **동일 조건 중심 해석**: 모델, 장비, 부하가 다른 실험 수치의 직접 우열 비교 제한 (종합 프롬프트 반영)
-- **검증 근거 중심 판단**: 검증된 근거 카드 활용 및 판단별 근거 ID 연결 (프롬프트 및 검증 로직 반영)
-- **사실과 추론 구분**: 사실, 추론, 자료 한계의 분리와 불확실성 명시 (출력 규격 및 프롬프트 반영)
-- **근거 부족의 과도한 해석 방지**: 자료 부족을 시장 부재나 기술 열세로 단정하는 해석 제한 (종합 프롬프트 반영)
-- **반대 근거 탐색 강화**: 반대 근거의 체계적 검색 및 수집 여부 평가 (추가 보완 필요)
+`agents/compat.py`는 검증, 종합, 작성용 임시 관점별 입력을 만든다. 이 호환 입력은 부모 State에 저장하지 않는다. Synthesis와 Writer의 LLM 입력에는 개별 `worker_results`, 이전 보고서와 `quality_feedback`도 전달되므로 수정 Loop가 실제 이전 문제를 반영한다.
 
-# Tech Stack
-
-선정 기준: 필요한 기능과 결과 품질을 충족하면서 반복 호출 비용과 로컬 실행 부담을 줄이는 구성
-
-| 구분                   | 기술                               | 용도 및 선정 이유                                                                                                       |
-| ---------------------- | ---------------------------------- | ----------------------------------------------------------------------------------------------------------------------- |
-| Framework              | **LangGraph**                | • 검증 결과와 근거 충족 여부에 따른 조건 분기  • 정상 처리, 근거 부족, 오류 경로 구분  • State 공유와 병렬 실행 관리 |
-| Framework              | **LangChain**                | • 문서 처리, 검색, 프롬프트 구성  • 모델 호출과 응답 처리의 순차적 연결  • 공통 인터페이스 기반 구성요소 재사용      |
-| LLM Provider           | **OpenAI**                   | • 로컬 생성 모델 구동 없이 API 활용  • 목적에 필요한 품질과 경제성 고려  • 토큰 사용량 기반 비용 관리                |
-| LLM / Generator, Judge | **GPT-4o-mini**              | • 조사, 검증, 종합 과정의 반복 호출  • 비용과 성능의 균형 고려                                                        |
-| Retrieval              | **FAISS**                    | • MIT 라이선스 오픈소스 기반 로컬 검색  • 별도 관리형 Vector DB 구독 불필요  • 소규모 논문 자료의 반복 검색          |
-| Embedding              | **BGE-M3 (`BAAI/bge-m3`)** | • 한국어와 영어 문서 및 질문의 벡터 변환  • 호출별 임베딩 API 요금 고려  • 로컬 MacBook 실행 부담 고려               |
-
-### LLM 경제성 판단 기준
-
-품질 조건을 통과한 모델 중 유효한 보고서 1건당 비용이 낮은 모델을 선정
-
-| 평가 항목   | 판단 기준                                                                                |
-| ----------- | ---------------------------------------------------------------------------------------- |
-| 목적 충족   | • 동일한 사용자 질문과 근거 자료 기반 한국어 보고서 작성  • 필수 평가 관점과 목차 충족 |
-| 결과 신뢰성 | • 출력 스키마 준수  • 본문 인용과 근거 일치  • 근거 없는 주장과 필수 항목 누락 확인   |
-| 비용        | • 총 API 비용 ÷ 품질 조건을 통과한 보고서 수  • 실패와 재시도 비용 포함               |
-| 처리 시간   | • 보고서 완료 시간 비교  • 호출별 지연시간, 재시도 횟수 비교                           |
-
-- GPT-4o mini 선정
-
-### BGE-M3 규모와 로컬 선정 근거
-
-| 항목           | 수치 및 의미                                                                                              |
-| -------------- | --------------------------------------------------------------------------------------------------------- |
-| 파라미터 수    | • 약 0.57B  • 공식 BGE Series 표 기준 568M                                                              |
-| 모델 크기      | • 공식 안내 기준 2.27 GB  • 전체 추론 메모리 사용량과 구분                                              |
-| 출력 벡터      | • 문서와 질문당 1,024차원                                                                                |
-| 최대 입력 길이 | • 최대 8,192토큰  • 입력 길이와 배치 크기에 따른 메모리, 처리 시간 변동                                 |
-| 언어 지원      | • 100개 이상 언어 지원  • 한국어 질문과 영어 논문 검색에 활용                                           |
-| 비용 구조      | • MIT 라이선스 모델의 로컬 실행  • 호출별 API 요금 제거  • 로컬 메모리, 저장 공간, 전력 사용 별도 부담 |
-
-선정 이유: 다국어 검색 능력과 모델 규모를 절충한 로컬 실행용 선택
-현재 프로젝트의 검색 구성은 다음과 같음
-
-- 청크 크기: 3,500자
-- 청크 중첩: 500자
-- 검색 방식: FAISS dense 벡터 검색
-
-## RAG 자료 구성
-
-논문의 경우, 노션에 게시된 레퍼런스 논문을 분야별로 1건씩 선정했다.
-
-- SW : TurboQuant
-- HW : ITME
-
-| 구분      | TurboQuant                                                                                      | ITME                                                                                                              |
-| --------- | ----------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------- |
-| 논문명    | **TurboQuant: Online Vector Quantization with Near-optimal Distortion Rate**              | **ITME: Inference Tiered Memory Expansion with Disaggregated CXL-Hybrid Memories**                          |
-| 로컬 파일 | `data/papers/turboquant.pdf`                                                                  | `data/papers/cxl_based_kv_cache.pdf`                                                                            |
-| 파일 버전 | arXiv:2504.19874v1                                                                              | arXiv:2606.12556v2                                                                                                |
-| 버전 날짜 | 2025-04-28                                                                                      | 2026-06-16                                                                                                        |
-| 페이지 수 | **25쪽**                                                                                  | **13쪽**                                                                                                    |
-| 주요 내용 | • 온라인 벡터 양자화  • 압축 오차와 내적 왜곡 감소  • KV cache 저비트 압축 및 품질 유지 실험 | • CXL-Hybrid 기반 추론 상태 용량 확장  • 다계층 DMA 프리패치  • CMM 및 NVMe SSD 성능 평가  • FPGA 시제품 검증 |
-| RAG 활용  | • SW 압축 원리  • 실험 조건  • 메모리 절감과 품질의 관계                                     | • HW 확장 구조  • 데이터 이동  • 처리량  • 검증 범위                                                          |
-
-### 인덱스 구성
-
-| 항목           | 구성                             |
-| -------------- | -------------------------------- |
-| TurboQuant     | 27개 청크                        |
-| ITME           | 27개 청크                        |
-| 전체           | 54개 청크                        |
-| 벡터 차원      | 1,024차원                        |
-| 근거 추적 정보 | 파일명, PDF 페이지 번호, 청크 ID |
-
-### 자료 활용 범위
-
-- 논문 RAG: 기술 원리와 실험 조건에 대한 근거 검색
-- 웹 조사: 최신 시장 현황과 채택 사례 보완
-- 근거 추적: 주장과 원문 위치를 대조할 수 있도록 출처 정보 보관
-
-# Agents
-
-| 에이전트        | 대응 파일            | 주요 역할                                                                                    | RAG |
-| --------------- | -------------------- | -------------------------------------------------------------------------------------------- | --- |
-| 슈퍼바이저      | `supervisor.py`    | • 조사 계획, 작업 배정  • 실행 순서와 병렬 처리 조정  • 결과 검토, 재조사 요청            | X   |
-| 기술 조사       | `technical.py`     | • 두 기술의 원문 확보  • 기술 개요, 적용 범위 정리  • 성능 조건과 한계 추출               | O   |
-| 시장 평가       | `market.py`        | • Tavily 및 수집 자료 활용  • 시장 규모, 상용화 현황 조사  • 채택 사례, 성장 전망 분석    | O   |
-| 이해관계자 평가 | `stakeholder.py`   | • 경쟁사, 도입 기업 반응 조사  • 개발자, 투자 업계 의견 조사  • 기대 효과와 우려 정리     | O   |
-| 도메인 평가     | `cloud_domain.py`  | • Tavily 및 수집 문서 활용  • 클라우드 적용성 평가  • 성능, 비용, 운영 조건 분석          | O   |
-| 근거 검증       | `verifier.py`      | • 출처 신뢰도, 최신성 확인  • 주장과 근거 일치 검증  • 비교 공정성 확인, 사실과 추론 구분 | △  |
-| 평가 종합       | `synthesis.py`     | • 관점별 의견의 일치와 상충 분석  • 적용 조건 차이 정리  • 불확실성 종합                  | X   |
-| 보고서 생성     | `report_writer.py` | • 단계별 결과, 종합 의견 정리  • 목차에 맞춘 보고서 구성  • 근거 및 인용 연결             | X   |
-
-- **O**: 외부 문서 또는 웹 검색을 통한 근거 검색 사용
-- **△**: 필요 시 근거 문서 재검색
-- **X**: 별도 벡터 검색 없이 전달받은 결과 활용
-
-# Architecture
-
-![프로젝트 아키텍처](report_images/notion-architecture.png)
+## State Schema
 
 ```text
-Supervisor (graph/workflow.py)
-    ↓
-기술 조사
-    ↓
-시장 평가 / 이해관계자 평가 / 클라우드 도메인 평가
-                   병렬 실행
-    ↓
-세 평가 완료 대기
-    ↓
-근거 검증
-    ↓
-평가 종합
-    ↓
-보고서 생성
+GlobalState
+  payload
+    user_query, selected_technologies, target_domain
+    research_plan, tasks                         # 현재 조사 batch
+    worker_results, evidence_cards               # 실행 동안 수집한 구조화 결과
+    verified_evidence_cards, usable_evidence_cards
+    verification, synthesis, report, report_metrics, evaluation, limitations
+  control
+    trace_id, step_count, revision_count, planning_round
+    task_status, retry_count, failed_tasks, last_error
+    status, decision, decision_reason, termination_reason, limits
 ```
 
-### 목표 아키텍처
+상태에는 체크포인트 직렬화가 가능한 dict와 list를 저장한다. LLM 경계에서 Pydantic 검증을 수행하고 `model_dump()`로 변환한다. 이전 최상위 `user_query` 입력도 받지만 새 호출은 `payload.user_query`를 사용한다. 보고서의 새 출력 위치는 `payload.report`다.
 
-Supervisor가 작업 배정, 실행 순서와 병렬 처리 조정, 결과 검토, 재조사 요청을 담당하는 구조다.
+| 항목 | 어떻게 구현했는가 | 왜 그렇게 했는가 |
+| --- | --- | --- |
+| 제어 vs 페이로드 분리 | 업무 데이터는 `payload`, Routing, 실행 ID, 횟수, 한도는 `control`에 저장 | 보고서 입력과 실행 제어를 구분하고 제어 필드의 병렬 충돌 방지 |
+| 관측성 위치 | 외부 JSONL 이벤트와 선택적 LangSmith span에 node, Task, 관점, 판단, 이유, 재시도, 시각 기록 | 로그와 전체 Prompt, Response, 검색 Document를 State에 계속 누적하지 않기 위해 |
+| 지속성 비용 | 검색 원문은 Worker 또는 기존 내부 그래프에서만 유지, 부모에는 최대 2,000자 발췌 카드와 구조화 결과 저장. Task와 카드 개수에도 상한 적용 | 매 체크포인트에 원문을 복제하는 비용을 줄이고 조사 Loop의 State 크기를 제한 |
+| State / Trace 상관 | `control.trace_id`를 모든 이벤트와 노드 span metadata에 전달. CLI는 루트 Trace metadata에도 전달 | 실행 State, 외부 로그, LangSmith 실행을 같은 ID로 연결 |
+| 재개 / 복구 | `build_workflow(checkpointer=...)`, 안정된 `thread_id`, `invoke(None, config)` 지원. CLI는 SQLite 저장과 `--resume` 제공 | 계획, pending Task, 성공한 병렬 작업 결과를 보존해 노드 경계에서 복구 |
+| 동시 처리 | `GlobalState.payload`에 `merge_payload`를 등록하고, 내부 `worker_results`와 `evidence_cards`에 ID별 associative upsert 적용. Worker는 Control을 쓰지 않음 | LangGraph가 중첩 TypedDict의 annotation을 자동으로 reduce하지 않으므로 외부 채널에서 명시적으로 병합. 재전달 중복도 방지 |
+| 종료 보장 | 매 제어 노드 실행 전 `MAX_STEPS`, 품질 실패 시 `MAX_REPORT_REVISIONS`, Worker 내부 `MAX_WORKER_RETRIES` 확인 | 상한 도달 후 재시도하지 않고 종료 이유와 `best_effort` 또는 `failed`를 남기기 위해 |
 
-- 주황 실선: 작업 배정과 재요청
-- 파란 점선: 결과 반환
+`MAX_STEPS`는 Orchestrator, Reducer barrier, Verifier, Synthesizer, Writer, Evaluator의 순차 실행 횟수다. 병렬 Worker 실행은 Task별 재시도 한도로 별도 제한한다. 기본값은 20 steps, 3 revisions, 2 worker retries이며 `.env` 또는 CLI로 변경한다. 추가 조사 Loop도 revision에 포함된다. LangGraph의 `recursion_limit`는 이 한도보다 크게 설정해 자체 상한이 먼저 종료를 처리하도록 한다.
 
-> 설계와 구현 구분: 아키텍처는 목표 설계, 현재 구현은 위 실행 흐름 기준.RAG 표기 기준: 이해관계자 평가의 RAG는 회의록 표 기준 `O` 적용(원본 이미지 `X`).
+초기 계획이 네 관점을 누락하면 해당 관점의 추가 Task를 생성한다. 이는 Task 수를 네 개로 고정하는 규칙이 아니다. 후속 계획은 품질 피드백과 사용 가능한 근거를 확인해 누락 관점만 보완한다. 계획 파싱 실패, 기술 범위 이탈, Task 상한 초과는 명확한 실패 상태로 종료한다.
 
-# Directory Structure
+`completed`는 네 품질 기준이 모두 통과한 경우다. 상한에 도달했지만 네 관점의 사용 가능한 근거와 보고서가 있으면 `best_effort`, 필수 관점의 근거 전체가 없거나 보고서 생성이 불가능하면 `failed`다. CLI는 `completed` 외에는 종료 코드 2를 반환한다. 생성된 보고서가 있어도 품질 통과로 오인하지 않도록 종료 안내를 붙인다.
+
+Worker 결과에는 카드가 포함되고 검색 카드 목록에도 조회용으로 저장하므로 일부 중복이 있다. 검증 카드도 별도 보존한다. 전체 원문을 저장하지 않으며 Task와 revision 한도로 총량을 제한한다. 장기 운영에서는 체크포인트 보존 주기와 오래된 실행 정리 정책을 별도로 마련해야 한다.
+
+Verifier, Synthesizer, Report Writer의 내부 그래프는 `checkpointer=False`로 컴파일한다. 부모 체크포인터가 내부 원문이나 전체 LLM 응답까지 저장하는 것을 방지하고, 복구는 부모 노드 경계에서 수행한다. 같은 PDF의 서로 다른 페이지는 URL과 locator 조합으로 구분하여 원문 검증 캐시를 재사용한다.
+
+공유 FAISS 인덱스에 다른 PC의 PDF 절대 경로가 남아 있으면, 두 기존 논문의 paper ID와 파일명이 일치하고 해당 경로가 없을 때 현재 `data/papers/` 파일로 검색 결과의 경로만 연결한다. 저장된 벡터와 청크 원문은 변경하지 않는다.
+
+종합과 보고서에 전달하는 Worker의 findings와 관점별 요약은 사용 가능한 검증 카드에서 다시 구성한다. Worker가 처음 수집한 미검증, 제외된 주장과 카드 ID가 검증 이후에 다시 인용되는 것을 막는다. 원본 WorkerResult는 조사 이력으로 유지한다.
+
+## Architecture
+
+```mermaid
+flowchart TD
+    START --> Init[입력과 trace_id 초기화]
+    Init --> O[Orchestrator: Structured ResearchPlan]
+    O -->|pending Task마다 Send, N은 Runtime 결정| W[동일 Research Worker의 N개 실행]
+    W -->|Task별 최대 2회 추가 재시도| W
+    W --> R[Payload Reducer와 결과 barrier]
+    R --> V[기존 Evidence Verifier]
+    V --> S[Synthesizer]
+    S --> RW[Report Writer]
+    RW --> Q[Quality Evaluator: Rules + LLM Judge]
+    Q -->|Groundedness 또는 Coverage 부족| O
+    Q -->|Bias 수정| S
+    Q -->|Neutrality 표현 수정| RW
+    Q -->|PASS| F[최종 상태와 종료 이유]
+    Q -->|Revision 또는 Step 상한| F
+    O -->|계획 오류 또는 Step 상한| F
+    R -->|Step 상한| F
+    V -->|Step 상한| F
+    S -->|Step 상한| F
+    RW -->|Step 상한| F
+    F --> END
+```
+
+Worker 재시도는 같은 Task 노드 안의 제한된 반복이며, 그래프의 Worker self-edge가 아니다. `Send`의 모든 실행이 같은 superstep에서 끝난 뒤 Reducer barrier가 한 번 실행된다. Worker 실패 결과는 limitation만 남기고 근거 입력에서 제외한다.
+
+품질 규칙은 SUMMARY, 네 관점과 한계 절, REFERENCE를 확인하고 본문 `[번호] → 참고문헌의 근거 ID → 사용 가능한 EvidenceCard → 원문 URL`을 검증한다. 제목만 있는 보고서나 전체 근거가 실패한 관점은 통과시키지 않는다. LLM Judge는 핵심 주장과 근거의 의미 일치, 중립성, 편향, 내용적 Coverage를 평가한다. Judge 호출이나 구조화 응답이 실패하면 품질 통과를 허용하지 않는다.
+
+API 사용 기준: [LangGraph Send와 Reducer](https://docs.langchain.com/oss/python/langgraph/graph-api), [체크포인트](https://docs.langchain.com/oss/python/langgraph/persistence), [SQLite Saver](https://reference.langchain.com/python/langgraph.checkpoint.sqlite/SqliteSaver/from_conn_string).
+
+## Directory Structure
 
 ```text
 SKALA_langgraph/
-├── data/
-│   ├── papers/                       # 원문 논문 PDF
-│   ├── vector_db/                    # FAISS 인덱스
-│   └── cache/                        # 수집 및 처리 캐시
+├── data/papers/                       # 기존 두 PDF
+├── data/vector_db/                    # 기존 FAISS 인덱스
 ├── src/kv_cache_agent/
-│   ├── main.py                       # 전체 워크플로 초기화 진입점
-│   ├── config.py                     # 공통 환경 및 경로 설정
-│   ├── llm.py                        # 공통 LLM 연결
+│   ├── main.py                       # Live / Mock / SQLite 복구 CLI
+│   ├── config.py                     # 경로, 환경변수, WorkflowLimits
+│   ├── llm.py                        # 기존 OpenAI 연결
+│   ├── observability.py              # 최소 이벤트와 LangSmith span
+│   ├── mock_run.py                   # 외부 서비스 Mock fixture
 │   ├── agents/
-│   │   ├── supervisor.py             # 작업 조정
-│   │   ├── technical.py              # 기술 조사
-│   │   ├── market.py                 # 시장 평가
-│   │   ├── stakeholder.py            # 이해관계자 평가
-│   │   ├── cloud_domain.py           # 클라우드 도메인 평가
-│   │   ├── verifier.py               # 근거 검증
-│   │   ├── synthesis.py              # 평가 종합
-│   │   └── report_writer.py          # 보고서 생성
-│   ├── graph/                        # State, 실행 그래프, 라우팅
-│   ├── schemas/                      # 결과, 근거 카드, 도구 응답 규격
-│   ├── rag/                          # PDF 분할, 임베딩, 인덱스 구성
-│   ├── tools/                        # 논문 검색, 웹 검색, 원문 수집, 인용 확인
-│   └── prompts/                      # 에이전트별 YAML 프롬프트
-├── tests/
-│   ├── fixtures/                     # 샘플 기술 조사 결과
-│   ├── test_state.py                 # 공통 State 및 규격 테스트
-│   ├── test_workflow.py              # 전체 실행 그래프 테스트
-│   ├── test_paper_rag.py              # 논문 RAG 테스트
-│   ├── test_web_tools.py             # 웹 도구 테스트
-│   ├── test_market.py                # 시장 평가 테스트
-│   ├── test_synthesis.py             # 평가 종합 테스트
-│   └── test_report_writer.py         # 보고서 생성 테스트
-├── outputs/
-│   ├── reports/                      # 보고서 산출물
-│   └── runs/                         # 실행별 산출물
-├── .env.example                      # 환경변수 예시
-├── .gitignore                        # Git 추적 제외 규칙
-├── .python-version                   # Python 버전 지정
-├── pyproject.toml                    # 프로젝트 및 의존성 설정
-├── uv.lock                           # 의존성 잠금 파일
-├── DEVELOPMENT_ORDER.md              # 개발 순서와 담당 범위
-└── README.md                         # 프로젝트 안내
+│   │   ├── orchestrator.py
+│   │   ├── research_worker.py
+│   │   ├── quality_evaluator.py
+│   │   ├── compat.py                 # 일시적 기존 입력 어댑터
+│   │   ├── verifier.py
+│   │   ├── synthesis.py
+│   │   ├── report_writer.py
+│   │   └── supervisor.py, technical.py, market.py,
+│   │       stakeholder.py, cloud_domain.py   # 기존 코드 보존
+│   ├── graph/state.py, routing.py, workflow.py
+│   ├── schemas/tasks.py, evaluation.py, outputs.py,
+│   │   technical.py, tool_outputs.py
+│   ├── rag/                          # 기존 PDF, BGE-M3, FAISS
+│   ├── tools/                        # 기존 검색, 원문 수집, PDF 도구
+│   └── prompts/                      # 신규 Planner / Worker / Judge YAML과 기존 YAML
+├── tests/                            # 기존 회귀 검사와 동적 구조 테스트
+├── outputs/reports/                  # Markdown, PDF
+├── outputs/logs/                     # 최소 요약 JSON, 이벤트 JSONL
+├── outputs/checkpoints/              # 선택적 SQLite DB (Git 제외)
+├── .env.example
+├── pyproject.toml, uv.lock
+├── DEVELOPMENT_ORDER.md              # 이전 Fixed Flow 개발 계획 기록
+└── README.md
 ```
 
-# Usage
+## Usage
 
-**진행 순서: 환경 준비 → API 키 설정 → 논문 인덱스 생성 → 워크플로 초기화 → 테스트**
-
-## 1. 실행 환경 준비
-
-- 실행 환경: Python 3.11, uv
-- 실행 위치: 프로젝트 루트 `SKALA_langgraph/`
-- 패키지 설치:
+프로젝트 루트에서 Python 3.11과 uv를 사용한다.
 
 ```bash
-uv sync
-```
-
-## 2. API 키와 모델 설정
-
-`.env` 파일이 없는 경우에만 예시 파일 복사:
-
-```bash
+uv sync --frozen
+# .env가 없을 때만 복사한 뒤 OpenAI / Tavily 키를 설정한다.
 cp .env.example .env
 ```
 
-`.env`에 아래 항목 설정:
+`OPENAI_MODEL=gpt-6-luna`, `EMBEDDING_MODEL=BAAI/bge-m3`가 기본값이다. GPT-6 Luna는 Responses API와 `reasoning.effort=none`, `temperature=0`으로 호출하여 기존의 추론 없는 생성 설정을 유지한다. [OpenAI 모델 문서](https://developers.openai.com/api/docs/models/gpt-6-luna), [GPT-6 API 호환성](https://developers.openai.com/api/docs/guides/latest-model)을 기준으로 설정했다. `HF_TOKEN`은 공개 모델 다운로드 인증에 사용할 수 있는 선택 항목이다. 키를 코드, YAML, 로그에 직접 쓰지 않는다.
 
-```dotenv
-TAVILY_API_KEY=
-OPENAI_API_KEY=
-OPENAI_MODEL=gpt-4o-mini
-EMBEDDING_MODEL=BAAI/bge-m3
-HF_TOKEN=
-```
+키는 Git에서 제외되는 `.env`에 입력하고 `.env.example`은 빈 키의 설정 예시로 유지한다. 이미 셸에 같은 환경 변수가 있으면 그 값이 `.env`보다 우선한다. `.env`의 키를 사용하려면 `env -u OPENAI_API_KEY -u TAVILY_API_KEY uv run python -m kv_cache_agent.main`으로 실행할 수 있다.
 
-- `TAVILY_API_KEY`: 웹 검색용 API 키
-- `OPENAI_API_KEY`: LLM 호출용 API 키
-- `OPENAI_MODEL`: 사용할 LLM 모델
-- `EMBEDDING_MODEL`: 논문 검색용 임베딩 모델
-- `HF_TOKEN`: Hugging Face 모델 다운로드용 토큰, 공개 모델 사용 시 선택 사항
-- 키 관리: Python 코드나 YAML에 직접 작성하지 않고 `.env`에서 관리
+OpenAI 요청에는 `OPENAI_REQUEST_TIMEOUT=120`초를 기본 적용한다. SDK의 제한된 전송 재시도와 별도로 Worker 재시도와 그래프 Step/Revision 상한을 적용한다. 공급자 응답이 지연되는 경우 체크포인트의 다음 노드에서 재개할 수 있다.
 
-## 3. 논문 검색 인덱스 생성
-
-- 입력 위치: `data/papers/`
-- 현재 자료: TurboQuant 및 ITME 논문, 총 38쪽
-- 자료 범위: 전체 문서 풀 최대 200페이지 이내
+기존 두 PDF를 `data/papers/`에 준비한 뒤 인덱스를 생성한다. 이미 해당 PDF의 인덱스가 있으면 재사용할 수 있다.
 
 ```bash
 uv run python -m kv_cache_agent.rag.ingest_papers
+uv run python -m kv_cache_agent.main --query "두 기술의 클라우드 적용성과 공급망을 평가해줘"
 ```
 
-**처리 과정:** PDF 로딩 → 문서 분할 → BGE-M3 임베딩 → FAISS 인덱스 생성
-
-- 저장 위치: `data/vector_db/`
-
-## 4. 워크플로 초기화
+외부 API, PDF 인덱스, 모델 다운로드 없이 전체 경로를 재현하는 Mock 실행:
 
 ```bash
-uv run python -m kv_cache_agent.main
+uv run python -m kv_cache_agent.main --mock --no-pdf
+uv run python -m kv_cache_agent.main --mock --no-pdf --query "공급망과 위험도 평가해줘"
 ```
 
-> **현재 명령의 수행 범위:** 그래프 생성 및 초기화 메시지 출력까지 수행. 전체 조사 실행과 보고서 파일 저장은 별도 호출 구현 필요.
-> **그래프에 구성된 처리 흐름**
+첫 Mock fixture는 5개, 공급망 질문 fixture는 7개 Task를 생성한다. 이는 테스트 데이터이며 실제 Planner의 Task 수를 고정하는 규칙이 아니다. 실제 Planner, Worker, Reducer, Verifier, Synthesizer, Writer, Evaluator를 실행하고 외부 LLM, Tavily, 논문 검색과 원문 조회만 Mock으로 바꾼다. Mock Judge PASS는 실제 연구 내용의 품질 통과를 의미하지 않는다.
 
-```text
-Supervisor → 기술 조사
-→ 시장, 이해관계자, 클라우드 도메인 평가 병렬 실행
-→ 근거 검증 → 평가 종합 → 보고서 생성
-```
+### 중간 검증 계획과 결과 보기
 
-**전체 그래프 실행 시 결과 및 저장 경로**
-
-- 반환 결과: `GlobalState`의 `final_report` 필드
-- 보고서 저장용 경로: `outputs/reports/`
-- 실행별 결과와 로그 저장용 경로: `outputs/runs/`
-- 파일 저장: 현재 초기화 명령의 자동 저장 기능과 구분
-
-## 5. 테스트
+전체 실행 전에 **계획 → Worker/Reducer → 근거 검증 → 종합 → 보고서 → 품질 평가** 순서로 각 결과를 확인한다. 검증 화면의 계획 표에는 단계별 확인 항목과 통과 기준을 적었다. Task 검색어와 출처 유형, 병합 결과, 검증된 카드, 첫 보고서와 수정된 보고서, 품질 평가 이유를 단계별 State에서 확인할 수 있다.
 
 ```bash
+uv run --extra recovery python -m kv_cache_agent.validation --with-tests
+```
+
+이 명령은 실제 그래프와 부모 체크포인트로 12개 Mock 시나리오를 실행하고, 전체 pytest, Ruff와 diff 검사 기록을 함께 저장한다. 정상 조사, 질문 변경에 따른 Worker 수 변화, 일시 실패와 회복, Worker 제외, 관점과 근거 부족 보완, 편향 재종합, 중립성 재작성, Step/Revision 상한, 필수 관점 전체 실패, SQLite 복구를 각각 확인한다.
+
+출력된 `outputs/validation/<실행 시각>/index.html`을 브라우저로 열면 검증 요약, 단계별 State, Task/Worker, 근거, 보고서, 품질/Routing, 외부 이벤트를 탐색할 수 있다. 같은 폴더의 `results.json`은 원본 검증 결과이며 시나리오별 Markdown 보고서도 저장한다. `--output-dir`로 저장 위치를 지정할 수 있다. 결과와 테스트 기록은 외부 검증 산출물이며 운영 State에 추가하지 않는다.
+
+편향/중립성 FAIL 주입은 수정 경로의 실행을 확인한다. LLM이 실제 편향을 정확히 탐지했다는 증거는 아니다. Mock PASS, 품질 PASS, 실제 자료의 정확성 검증을 구분해서 판단한다.
+
+실제 API 검증은 유효한 키를 설정한 뒤 별도로 실행한다.
+
+```bash
+uv run --extra recovery python -m kv_cache_agent.validation --live-smoke
+```
+
+이 옵션은 일반 응답, `ResearchPlan`, `QualityEvaluation`의 실제 응답을 소규모로 확인한다. 실패하면 유형과 상태 코드만 저장하고 API 키와 오류 본문은 저장하지 않는다. 기본 실행은 API를 호출하지 않으며, 이전 인증 실패 기록이 있다면 이전 기록임을 명시해 표시한다. 연결 성공 후 기존 CLI를 `--mock` 없이 실행하고, 기술별 논문 페이지, 웹 원문, 상충 근거와 인용을 사람이 표본 대조해야 실제 조사 검증이 완료된다.
+
+SQLite와 요약 로그를 남긴 실제 실행도 같은 화면에서 확인할 수 있다.
+
+```bash
+uv run --extra recovery python -m kv_cache_agent.main \
+  --checkpoint-db outputs/checkpoints/research.sqlite --thread-id live-001 \
+  --log-file outputs/logs/live.json
+uv run --extra recovery python -m kv_cache_agent.validation \
+  --live-run-log outputs/logs/live.json \
+  --checkpoint-db outputs/checkpoints/research.sqlite \
+  --output-dir outputs/validation/live
+```
+
+내보내기는 저장된 부모 체크포인트를 읽으며 검색과 보고서 생성을 다시 호출하지 않는다. 추가 연결 검사가 필요할 때만 `--live-smoke`를 붙인다. 실제 품질 FAIL과 `best_effort` 종료도 숨기지 않고 표시하며 이 경우 CLI의 종료 코드는 2다.
+
+실행 결과는 `outputs/reports/`의 Markdown과 PDF, `outputs/logs/`의 요약 JSON과 이벤트 JSONL에 저장한다. `--no-pdf`로 PDF 저장을 생략할 수 있다. 요약 로그는 전체 State, 원문, Prompt, LLM Response를 복제하지 않는다.
+
+```bash
+uv run python -m kv_cache_agent.main --max-steps 20 --max-report-revisions 3 --max-worker-retries 2
 uv run pytest -q
+uv run ruff check src tests
 ```
 
-- 일반 테스트: OpenAI와 Tavily API를 Mock으로 대체하는 방식
-- 검증 구분: Mock 기반 테스트와 실제 API 연동 검증의 분리
+SQLite 복구가 필요한 경우에만 extra를 설치한다.
 
-## 6. 재현 조건 관리
+```bash
+uv sync --frozen --extra recovery
+uv run --extra recovery python -m kv_cache_agent.main \
+  --checkpoint-db outputs/checkpoints/research.sqlite --thread-id study-001
+# 중단 후 같은 DB와 thread_id를 사용
+uv run --extra recovery python -m kv_cache_agent.main \
+  --checkpoint-db outputs/checkpoints/research.sqlite --thread-id study-001 --resume
+```
 
-**환경 및 모델**
+`--resume`은 새 질문을 넣어 계획을 다시 시작하지 않고 체크포인트의 다음 노드에서 재개한다. 기존 thread를 새 실행으로 덮어쓰려 하면 CLI가 거부한다. 새 조사는 새 thread ID를 사용한다. 완료된 thread를 재개하면 저장된 최종 결과를 돌려준다.
 
-- Python 버전: `.python-version` 기준
-- 패키지 버전: `uv.lock` 기준
-- LLM 모델: `OPENAI_MODEL` 설정값
-- 임베딩 모델: `BAAI/bge-m3`
-  **자료 및 검색**
-- 원문 자료: `data/papers/`의 동일한 PDF, 전체 200페이지 이내
-- 청크 설정: 크기 3,500자, 중첩 500자
-- 검색 방식: FAISS 벡터 검색
-- 웹 조사 기록: 실행 날짜, 검색 질의, 출처 URL, 발행일
-  **검증 및 출력**
-- 테스트 환경: OpenAI와 Tavily API Mock 사용
-- 결과 형식: `AgentResult`, `EvidenceCard`, `final_report`
+Worker 노드 내부 재시도 자체는 노드별 체크포인트 대상이 아니다. 프로세스가 Worker 중간에 종료되면 미완료 Worker의 검색이나 LLM 호출은 반복될 수 있다. 이미 성공한 Task의 pending writes와 ID별 Reducer는 완료 결과의 중복 누적을 방지한다.
 
-> 웹 검색 결과와 시장 정보의 시점별 변동 가능성. 동일 조건 비교를 위한 실행 날짜와 사용 출처 기록 필요.
+프로그램에서 호출할 때:
 
-# Contributors
+```python
+from kv_cache_agent.graph.workflow import build_workflow
+
+result = build_workflow().invoke({
+    "payload": {
+        "user_query": "TurboQuant와 CXL-based KV Cache를 평가해줘",
+        "target_domain": "클라우드 LLM 서빙",
+    },
+})
+print(result["control"]["status"])
+print(result["payload"].get("report", ""))
+```
+
+LangSmith 사용 시 `.env`의 `LANGSMITH_TRACING=true`, `LANGSMITH_API_KEY`, `LANGSMITH_PROJECT`를 설정한다. `trace_id`로 실행을 찾고 다음을 확인한다.
+
+실제 키는 Git에서 제외된 `.env`에만 넣는다. `.env.example`은 로드하지 않는 설정 예시다.
+설정을 바꾼 뒤 새 Python 프로세스로 실행한다. 환경 변수에 오래된 키가 있으면 `.env`보다 우선하므로 해당 환경 변수도 확인한다.
+
+```bash
+uv run python -m kv_cache_agent.tracing_check
+```
+
+이 명령은 작은 연결 진단 Trace를 업로드하고 종료 상태와 Task 이벤트를 다시 조회한다.
+`outputs/validation/langsmith-check/result.json`에 상태, 프로젝트, 로그인 후 볼 수 있는 `run_url`을 저장한다.
+키나 인증 오류 본문은 저장하지 않는다. 연결 진단은 조사 Workflow의 품질 PASS를 의미하지 않는다.
+CLI가 종료되기 전 업로드 큐를 flush한다. 동일 노드에서 배정한 각 Task와 Routing 판단은 metadata 외에 개별 Trace event로 보존한다.
+
+- `orchestrator`: 계획 이유, Task 수, planning round.
+- `dynamic_fan_out`: 각 Task의 task_id, 관점과 배정 목적 (외부 이벤트와 Trace events).
+- `worker_attempt`: task_id, perspective, retry_count, 실패와 성공.
+- `verifier`, `synthesis`, `report_writer`: 근거 검증과 보고서 처리 경로.
+- `quality_evaluator`, `quality_routing`: 네 평가 이유와 추가 조사, 재종합, 재작성 결정.
+- `finalize`: completed / best_effort / failed와 termination_reason.
+
+Mock 실행은 LangSmith 업로드를 비활성화한다. 실제 API 조사와 LangSmith UI에서의 Trace 확인은 별도 환경 검증이 필요하다. 웹 자료의 시점 변동, LLM 판단 오류, 검색 누락은 남아 있으며 테스트 통과를 실제 기술 평가 정확성과 동일하게 취급하지 않는다.
+
+### 품질 상한 도달 후 보완
+
+상한을 늘리기 전에 실패 원인을 분리한다. CXL의 수치는 연구, 지표, 기준선과 실험 조건을 함께 기록한다.
+ITME의 NVMe-oF 대비 처리량 1.80배와 CPU-offload 대비 최대 35.7%는 기준선이 다르다.
+별도 CXL KV 저장 연구의 배치 크기 30% 증가는 처리량과 다른 지표다. 이 숫자 차이만으로 상충이라고 판정하지 않는다.
+Verifier는 카드별 출처를 분리해 병렬로 비교하며, 긴 원문은 주장 주변의 발췌를 포함한다.
+`p. 2; p. 10`처럼 떨어진 페이지를 정확히 읽고, 반환된 모든 인용문을 해당 원문과 문자 대조한다.
+검색 발췌에서 확인하지 못했다는 판단은 조사 한계로 옮기며 원문에 없는 반대 근거로 사용하지 않는다.
+
+시장성은 공식 제품 지원/상용화 상태와 비용 가정, 이해관계자는 공급사/표준 단체/운영자 역할과 제약,
+도메인은 구체적 워크로드/하드웨어/SLO 근거를 추가 조사한다. 웹 원문도 기존 출처 연결 구조화 추출기로
+우선 분석하고, 시장성/이해관계자 카드가 없을 때 기존 정규화/분류 helper를 보조로 사용한다.
+공개 가격이나 고객 사례가 없으면 미확인으로 남긴다.
+관점의 실제 근거가 없거나 출처 없는 채택 주장을 작성하면 계속 품질 FAIL이다.
+
+Planner의 `search_queries`는 180자 이내의 검색어 1~3개, `preferred_domains`는 공식 출처 도메인,
+`expected_evidence`는 확인할 근거를 담는다. 상세 지시는 `objective`에 둔다.
+웹 검색은 Tavily `advanced`로 수행하며 첫 시도는 우선 도메인을 제한할 수 있다.
+통신 실패는 동일 검색어로 재시도하고, 근거 부족 또는 기존 카드와 중복이면 대체 검색어와 열린 출처 검색으로 전환한다.
+기본 재시도 2회 이후에도 근거가 없으면 결과를 제외한다. 제한된 `search_attempts` 요약에는 검색어,
+출처 ID, 근거 개수와 실패 유형만 저장한다. Planner는 이 기록을 보고 후속 조사에서 같은 실패 검색을 피한다.
+전체 문서는 State에 저장하지 않는다. `worker_search` 이벤트에서 각 검색 전략과 신규 출처 수를 확인할 수 있다.
+
+수치 근거는 `metric`, `value`, `unit`, `baseline`, `conditions`를 갖는다. 조건은 모델, 하드웨어,
+소프트웨어, 워크로드, SLO로 나누며 원문에 없는 항목은 null이다. Verifier는 구조화한 수치도 실제 인용문에 있는지 검사한다.
+종합과 보고서의 숫자 검사는 검증된 카드의 실험 조건과 기준선도 읽으며 `1.80`과 `1.8`의 동일 표기를 정규화한다.
+Writer의 본문에 구조화한 근거 ID가 중복 출력되면 같은 문단에 연결된 유효 ID만 제거하고, 인용 번호는 renderer가 부여한다.
+알 수 없는 인용과 새로 만든 수치는 계속 거부한다. 실행 처리 건수는 연구 성능 수치와 구분해 검증 화면에 기록한다.
+Synthesizer, Writer, Judge에 같은 비교 가능성 정보를 전달한다. 지표, 단위, 기준선이 다르거나 조건이 미확인이면
+직접 비교를 허용하지 않는다. 동일 논문의 로컬 PDF와 arXiv URL은 같은 `source_id`로 계산하고,
+동일 관점의 중복 근거는 최종 지원 근거에서 제거하되 수집 카드와 검증 기록은 남긴다.
+현재 중복 판단은 정규화한 주장 또는 구조화한 수치의 동일성 기준이며, 의미가 비슷한 모든 문장을 자동 병합하지는 않는다.
+
+Judge는 보고서 품질과 기술의 상용 성숙도를 구분한다. 공식 지원 범위와 연구 상태, 역할, 적용 조건이 근거로 연결되면
+실제 가격이나 고객 인터뷰가 없다는 사실 하나만으로 FAIL하지 않는다. 출처 없는 도입 주장, 빈 관점, 우열 단정은 계속 FAIL이다.
+실제 Judge의 기준 검증은 별도 fixture로 수행하며 전체 보고서 PASS와 구분한다.
+
+```bash
+uv run python scripts/calibrate_quality_judge.py --checkpoint-db outputs/checkpoints/live-operation.sqlite --thread-id live-operation-20261007-b --audit-file outputs/validation/resolution/cxl-revalidation.json --output-dir outputs/validation/improved-operation
+```
+
+SQLite에 저장된 실행의 후속 계획만 검토하려면 다음을 사용한다. Worker 실행과 보고서 재평가는 수행하지 않는다.
+
+```bash
+uv run python scripts/plan_checkpoint_gaps.py --checkpoint-db outputs/checkpoints/live-operation.sqlite --thread-id live-operation-20261007-b --output-dir outputs/validation/resolution
+```
+
+같은 체크포인트의 CXL 수치만 실제 원문과 재대조할 수 있다. 수치 감사용 수동 입력은 Worker 결과와 구분해 기록한다.
+
+```bash
+uv run python scripts/revalidate_checkpoint_cxl.py --checkpoint-db outputs/checkpoints/live-operation.sqlite --thread-id live-operation-20261007-b --output-dir outputs/validation/resolution
+```
+
+이미 `best_effort`로 종료한 thread는 `--resume`으로 품질 Loop를 다시 시작하지 않는다.
+수정한 전체 Workflow 검증은 새 `--thread-id`로 실행한다. LangSmith 활성화 이전 실행에는 과거 Trace가 소급 생성되지 않는다.
+
+## 읽기 쉬운 보고서와 10페이지 제한
+
+Synthesizer는 문장을 다듬으면서 기술별, 관점별 근거를 통합한다. 긴 나열을 짧은 문장으로 나누고
+판단 → 근거 → 적용 조건과 한계 순서로 쓴다. `claim_type`, Evidence ID, 실험의 기준선과 조건,
+반대 근거는 보존한다. Writer는 같은 원리와 일반론의 반복을 줄이고 불확실성을 6장에 요약한다.
+Worker의 원시 한계와 내부 진단은 체크포인트와 검증 화면에서 보존하며 보고서에 그대로 덧붙이지 않는다.
+
+문장을 다듬을 때 관점별 분석의 깊이도 유지한다. 4.1~4.4에는 확인된 근거, 판단의 이유와 운영·시장상 의미,
+적용 조건을 구분한다. Synthesizer의 핵심 판단을 `analysis_requirements`로 Writer에 전달하며,
+근거가 있는 관점과 기술의 인용된 `inference`가 사라지면 Writer가 최대 두 번 복원한다.
+인용과 문단 유형 검사는 해석 존재 여부를 확인하고, Judge는 실제 내용과 의미 보존을 별도로 평가한다.
+시장성의 수요와 도입 장벽, 이해관계자의 역할과 부담, 도메인의 병목별 효과를 사실 나열이나 자료 부족 문구로 대체하지 않는다.
+
+최종 A4 PDF는 **REFERENCE를 포함해 최대 10페이지**다. 동일한 ReportLab 레이아웃으로 실제 페이지를
+측정하고 초과하면 Writer가 최대 두 번 축약한다. 필수 절, 인용, 중요한 비교 조건은 유지하고,
+글꼴을 작게 하거나 페이지를 잘라내지 않는다. 그래도 초과하면 명확한 실패로 끝낸다.
+`write_pdf`도 저장 전에 상한을 검사하므로 초과 PDF를 게시하거나 기존 파일을 덮어쓰지 않는다.
+PDF 저장 실패 시 CLI는 Markdown과 오류 요약을 남기고 종료 코드 2를 반환한다.
+
+| 설정 | 기본값 | 역할 |
+| --- | --- | --- |
+| `MAX_REPORT_PAGES` | 10 | 참고문헌을 포함한 실제 A4 페이지 상한, 1~10 허용 |
+| `MAX_LENGTH_REWRITES` | 2 | Writer 내부의 축약 재시도 한도 |
+| `MAX_ANALYSIS_REWRITES` | 2 | 근거 기반 해석이 누락된 경우 Writer 내부의 복원 한도 |
+| `REPORT_BODY_CHARS` | 15000 | 해석을 보존하는 본문 생성 목표, 실제 페이지 검사의 대체 기준이 아님 |
+
+분량 수정은 외부 품질 Loop의 `MAX_REPORT_REVISIONS`와 별도로 제한한다.
+완성된 보고서는 다시 Quality Evaluator를 거친다. State에는 `report_metrics`의 페이지 수,
+상한, 축약과 해석 복원 횟수만 저장하고 PDF 바이트와 수정 초안은 누적하지 않는다.
+페이지 검사는 한국어 글꼴을 사용하며 `--no-pdf` 실행에서도 같은 분량 기준을 적용한다.
+LangSmith의 `report_length_check` 이벤트에서 페이지 수와 `shorten`, `done`, `error` 결정을 확인할 수 있다.
+`report_analysis_check` 이벤트에서는 누락된 절, `revise`, `done`, `error`와 복원 횟수를 확인한다.
+
+검증이 끝난 실행의 근거를 재사용해 문장과 분량만 개선하려면 다음을 실행한다.
+원본 체크포인트와 보고서를 보존하고 새 결과, PDF, 읽기 화면을 만든다.
+이 경로는 검색과 Worker를 재실행하는 전체 연구 Workflow와 구분한다.
+품질이 계속 부족하면 추가 근거를 만들어내지 않고 `best_effort`와 평가 이유를 남긴다.
+
+```bash
+uv run python scripts/revise_checkpoint_report.py \
+  --checkpoint-db outputs/checkpoints/improved-operation.sqlite \
+  --thread-id live-operation-20261007-c \
+  --output-dir outputs/validation/improved-operation/readable
+```
+
+## Contributors
+
+기존 기여 정보는 그대로 보존한다.
 
 | 이름   | 담당 에이전트                   | 수행 역할                                                          |
 | ------ | ------------------------------- | ------------------------------------------------------------------ |

@@ -71,6 +71,7 @@ def search_web(
     topic: SearchTopic = "general",
     include_raw_content: bool = False,
     exclude_domains: Sequence[str] | None = DEFAULT_EXCLUDED_DOMAINS,
+    include_domains: Sequence[str] | None = None,
     client: TavilyClient | None = None,
 ) -> list[WebSearchResult]:
     """Tavily에서 웹 검색을 수행하고 공통 결과 형식으로 반환한다.
@@ -93,9 +94,7 @@ def search_web(
         search_client = TavilyClient(api_key=TAVILY_API_KEY)
 
     clean_excluded_domains = [
-        domain.strip()
-        for domain in (exclude_domains or [])
-        if str(domain).strip()
+        domain.strip() for domain in (exclude_domains or []) if str(domain).strip()
     ]
     search_kwargs: dict[str, Any] = {
         "query": clean_query,
@@ -106,6 +105,8 @@ def search_web(
     }
     if clean_excluded_domains:
         search_kwargs["exclude_domains"] = clean_excluded_domains
+    if include_domains:
+        search_kwargs["include_domains"] = list(include_domains)
 
     try:
         response = search_client.search(**search_kwargs)

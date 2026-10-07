@@ -68,6 +68,7 @@
 import json
 import re
 from copy import deepcopy
+from decimal import Decimal
 from functools import lru_cache, wraps
 from pathlib import Path
 from typing import Any, Literal, TypedDict
@@ -77,7 +78,9 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from langgraph.graph import END, START, StateGraph
 from pydantic import BaseModel, ConfigDict, Field
 
-from kv_cache_agent.graph.state import GlobalState
+from kv_cache_agent.agents.compat import grounded_worker_results, legacy_view
+from kv_cache_agent.evidence import comparison_context
+from kv_cache_agent.graph.state import LegacyState as GlobalState
 from kv_cache_agent.llm import get_llm
 
 PROMPT_PATH = Path(__file__).resolve().parents[1] / "prompts" / "synthesis.yaml"
@@ -114,9 +117,7 @@ _FRACTION_PATTERN = re.compile(
 _NUMBER_WORD_PATTERN = re.compile(
     r"\b(?:" + "|".join(_NUMBER_WORDS) + r")\b", re.IGNORECASE
 )
-_NUMERIC_PATTERN = re.compile(
-    r"(?<![\w.])\d+(?:[.,]\d+)*(?:/\d+(?:[.,]\d+)*)?"
-)
+_NUMERIC_PATTERN = re.compile(r"(?<![\w.])\d+(?:[.,]\d+)*(?:/\d+(?:[.,]\d+)*)?")
 
 
 class Statement(BaseModel):
@@ -175,8 +176,7 @@ def _verified_cards(state: GlobalState) -> tuple[dict[str, dict], list[str]]:
     allowed = {
         key: card
         for key, card in cards.items()
-        if card.get("verification_status")
-        in {"verified", "partially_verified"}
+        if card.get("verification_status") in {"verified", "partially_verified"}
         and all(
             isinstance(card.get(k), str) and card[k].strip()
             for k in ("claim", "evidence_text", "source_title", "source_url")
@@ -214,7 +214,16 @@ def _validate_numbers(text: str, ids: list[str], cards: dict[str, dict]) -> None
     source = " ".join(
         str(cards[key].get(field, ""))
         for key in ids
-        for field in ("claim", "evidence_text", "caveat")
+        for field in (
+            "claim",
+            "evidence_text",
+            "caveat",
+            "metric",
+            "value",
+            "unit",
+            "baseline",
+            "conditions",
+        )
     )
 
     def normalize_fraction(match: re.Match[str]) -> str:
@@ -229,7 +238,17 @@ def _validate_numbers(text: str, ids: list[str], cards: dict[str, dict]) -> None
         normalized = value.lower().replace("‑", "-").replace("–", "-")
         normalized = _FRACTION_PATTERN.sub(normalize_fraction, normalized)
         normalized = _NUMBER_WORD_PATTERN.sub(normalize_number_word, normalized)
-        return set(_NUMERIC_PATTERN.findall(normalized))
+
+        # Source-reported 1.80 and 1.8 are the same value; version/ratio tokens
+        # with multiple separators are preserved instead of guessed.
+        def canonical(token):
+            if "/" in token:
+                return "/".join(canonical(part) for part in token.split("/"))
+            if re.fullmatch(r"\d+(?:\.\d+)?", token):
+                return str(Decimal(token).normalize())
+            return token
+
+        return {canonical(token) for token in _NUMERIC_PATTERN.findall(normalized)}
 
     if not numeric_tokens(text) <= numeric_tokens(source):
         raise ValueError("Numeric claim absent from cited evidence")
@@ -378,7 +397,11 @@ def _synthesis_context(local: SynthesisState) -> dict[str, Any]:
     state, cards = local["request"], local["cards"]
     return {
         "user_query": state.get("user_query", ""),
+        "worker_results": grounded_worker_results(state, cards),
+        "quality_feedback": state.get("quality_feedback", {}),
+        "previous_report": state.get("final_report", ""),
         "evidence_cards": list(cards.values()),
+        "measurement_comparisons": comparison_context(list(cards.values())),
         "evidence_cards_by_perspective": {
             perspective: [
                 card
@@ -390,7 +413,11 @@ def _synthesis_context(local: SynthesisState) -> dict[str, Any]:
         "perspective_results": {
             perspective: {
                 "status": state.get(f"{perspective}_result", {}).get("status"),
-                "summary": state.get(f"{perspective}_result", {}).get("summary", ""),
+                "summary": "\n".join(
+                    card["claim"]
+                    for card in cards.values()
+                    if card.get("perspective") == perspective
+                ),
                 "evidence_ids": [
                     key
                     for key in state.get(f"{perspective}_result", {}).get(
@@ -408,9 +435,7 @@ def _synthesis_context(local: SynthesisState) -> dict[str, Any]:
             )
         },
         "perspective_limitations": {
-            perspective: state.get(f"{perspective}_result", {}).get(
-                "limitations", []
-            )
+            perspective: state.get(f"{perspective}_result", {}).get("limitations", [])
             for perspective in PERSPECTIVES
         },
     }
@@ -596,11 +621,15 @@ def build_synthesis_graph():
     graph.add_edge("insufficient_after_validation", END)
     graph.add_edge("insufficient", END)
     graph.add_edge("failure", END)
-    return graph.compile()
+    # Prevent inherited parent checkpointers from storing raw response State.
+    return graph.compile(checkpointer=False)
 
 
 def synthesis_agent(state: GlobalState) -> dict[str, Any]:
     """GlobalState를 내부 그래프에 전달하고 synthesis_result만 외부에 반환."""
+    if "payload" in state:
+        result = synthesis_agent(legacy_view(state))
+        return {"payload": {"synthesis": result["synthesis_result"]}}
     try:
         result = build_synthesis_graph().invoke({"request": deepcopy(state)})
         return result["output"]

@@ -128,8 +128,7 @@ def test_synthesis_consumes_explicit_global_verified_cards(state, monkeypatch):
     assert output["evidence_ids"]
     loader.assert_called_once()
     assert all(
-        card["verification_status"] == "unverified"
-        for card in state["evidence_cards"]
+        card["verification_status"] == "unverified" for card in state["evidence_cards"]
     )
 
 
@@ -151,6 +150,40 @@ def test_synthesis_uses_partial_cards_as_provisional_evidence(state, monkeypatch
     assert output["evidence_ids"]
     assert any("부분 검증" in item for item in output["limitations"])
     loader.assert_called_once()
+
+
+def test_dynamic_worker_context_excludes_rejected_claims(state, monkeypatch):
+    state = verified(state)
+    accepted = state["usable_evidence_cards"][0]
+    rejected = {
+        **accepted,
+        "evidence_id": "excluded-live-card",
+        "claim": "제외된 미검증 주장",
+    }
+    state["dynamic_worker_results"] = [
+        {
+            "task_id": "runtime-task",
+            "perspective": "technical_maturity",
+            "status": "success",
+            "findings": [rejected["claim"]],
+            "evidence_cards": [accepted, rejected],
+            "limitations": [],
+        }
+    ]
+    state["technical_result"]["summary"] = rejected["claim"]
+    before = deepcopy(state)
+    _, llm = install_llm(monkeypatch, draft(state))
+
+    module.synthesis_agent(state)
+
+    context = json.loads(
+        llm.with_structured_output.return_value.invoke.call_args.args[0][1].content
+    )
+    assert rejected["evidence_id"] not in json.dumps(context, ensure_ascii=False)
+    assert rejected["claim"] not in json.dumps(context, ensure_ascii=False)
+    assert context["worker_results"][0]["findings"] == [accepted["claim"]]
+    assert context["worker_results"][0]["evidence_cards"] == [accepted]
+    assert state == before
 
 
 def test_synthesis_rejects_partial_card_as_fact(state, monkeypatch):
@@ -199,9 +232,7 @@ def test_perspective_mismatch_does_not_retry(state, monkeypatch):
     state["usable_evidence_cards"].append(deepcopy(cross_perspective))
 
     invalid = draft(state)
-    invalid["comparison_rows"][0]["evidence_ids"] = [
-        cross_perspective["evidence_id"]
-    ]
+    invalid["comparison_rows"][0]["evidence_ids"] = [cross_perspective["evidence_id"]]
     loader, llm = install_llm(monkeypatch, invalid)
 
     output = module.synthesis_agent(state)["synthesis_result"]

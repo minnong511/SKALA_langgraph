@@ -1,8 +1,11 @@
 """EvidenceCard를 원문과 대조하는 LangGraph 기반 근거 검증 에이전트."""
 
+import json
 import re
+import unicodedata
 from copy import deepcopy
 from datetime import UTC, date, datetime
+from decimal import Decimal
 from pathlib import Path
 from typing import Any, Literal, TypedDict
 from urllib.parse import urlparse
@@ -13,8 +16,10 @@ from langgraph.graph import END, START, StateGraph
 from pydantic import BaseModel, Field
 from pypdf import PdfReader
 
+from kv_cache_agent.agents.compat import compact_verification, legacy_view
 from kv_cache_agent.config import ROOT_DIR
-from kv_cache_agent.graph.state import GlobalState
+from kv_cache_agent.evidence import source_identity
+from kv_cache_agent.graph.state import LegacyState as GlobalState
 from kv_cache_agent.llm import get_llm
 from kv_cache_agent.schemas.outputs import EvidenceCard
 from kv_cache_agent.schemas.tool_outputs import FetchedSource
@@ -35,6 +40,7 @@ class ClaimEvidenceDecision(BaseModel):
     evidence_id: str
     support_level: SupportLevel
     matched_text: str = ""
+    matched_quotes: list[str] = Field(default_factory=list)
     rationale: str
     claim_type_assessment: ClaimTypeAssessment
 
@@ -119,20 +125,73 @@ def _validate_card_metadata(card: EvidenceCard) -> list[str]:
 def _extract_pdf_pages(path: Path, source_locator: str) -> str:
     """논문 locator의 페이지를 우선 읽고 없으면 PDF 전체에서 일부를 읽는다."""
     reader = PdfReader(str(path))
-    page_numbers = [int(number) for number in re.findall(r"\d+", source_locator)]
-    if page_numbers:
-        start = max(page_numbers[0] - 1, 0)
-        end = min((page_numbers[-1] if len(page_numbers) > 1 else start + 1), len(reader.pages))
-        selected_indexes = range(start, max(start + 1, end))
-    else:
-        selected_indexes = range(min(3, len(reader.pages)))
+    # p. 2; p. 10 selects two pages, whereas pp. 2-10 selects a range.
+    # Table/section numbers are not page locators.
+    pages = set()
+    for match in re.finditer(
+        r"(?:\bpp?\.?|\bpages?\b)\s*(\d+(?:\s*[-–,;]\s*\d+)*)",
+        source_locator,
+        re.IGNORECASE,
+    ):
+        for part in re.split(r"[,;]", match[1]):
+            bounds = [int(n) for n in re.findall(r"\d+", part)]
+            pages.update(range(bounds[0], bounds[-1] + 1))
+    selected_indexes = (
+        sorted(p - 1 for p in pages) if pages else range(min(3, len(reader.pages)))
+    )
 
     page_texts = [
-        (reader.pages[index].extract_text() or "").strip()
+        f"[PDF page {index + 1}]\n{(reader.pages[index].extract_text() or '').strip()}"
         for index in selected_indexes
         if 0 <= index < len(reader.pages)
     ]
     return "\n\n".join(text for text in page_texts if text)[:30_000]
+
+
+def _normalized_text(text: str) -> str:
+    """PDF decimal/line-break spacing must not invalidate a literal quotation."""
+    return re.sub(r"\s+", "", unicodedata.normalize("NFKC", text)).casefold()
+
+
+def _is_retrieval_limitation(card: EvidenceCard) -> bool:
+    claim = str(card.get("claim", ""))
+    return bool(
+        re.search(
+            r"검색.{0,30}(?:결과|발췌)|제공.{0,20}(?:자료|발췌)|발췌.{0,10}만으로",
+            claim,
+        )
+        and re.search(r"(?:검증|확인|판단)할 수 없|미확인|확인되지|검증되지", claim)
+    )
+
+
+def _source_excerpt(card: EvidenceCard, content: str) -> str:
+    """Keep bounded, verbatim windows near the submitted claim, including the tail."""
+    if len(content) <= MAX_SOURCE_CHARS_PER_CARD:
+        return content
+    submitted = f"{card.get('claim', '')} {card.get('evidence_text', '')}"
+    anchors = list(
+        dict.fromkeys(re.findall(r"(?<!\d)\d+(?:\.\d+)?(?!\d)\s*%?", submitted))
+    )
+    anchors += sorted(
+        set(re.findall(r"[A-Za-z][A-Za-z-]{7,}", submitted)), key=len, reverse=True
+    )[:8]
+    starts = [0]
+    for anchor in anchors:
+        # PDF extraction can render 1.80 as '1 .80'.
+        pattern = r"\s*".join(re.escape(c) for c in re.sub(r"\s+", "", anchor))
+        if anchor.strip()[0].isdigit():
+            pattern = rf"(?<!\d){pattern}(?!\d)"
+        match = re.search(pattern, content, re.IGNORECASE)
+        if match:
+            start = max(0, match.start() - 500)
+            if all(abs(start - old) > 800 for old in starts):
+                starts.append(start)
+        if len(starts) == 5:
+            break
+    return "\n\n".join(
+        f"[source excerpt offset={start}]\n{content[start : start + 1500]}"
+        for start in sorted(starts)
+    )[:MAX_SOURCE_CHARS_PER_CARD]
 
 
 def _fetch_original_source(card: EvidenceCard) -> FetchedSource:
@@ -201,7 +260,7 @@ def _build_comparison_context(
     for index, card in enumerate(cards, start=1):
         evidence_id = _card_id(card, index)
         source = sources.get(evidence_id, {})
-        content = str(source.get("content", ""))[:MAX_SOURCE_CHARS_PER_CARD]
+        content = _source_excerpt(card, str(source.get("content", "")))
         context_parts.append(
             "\n".join(
                 [
@@ -213,6 +272,7 @@ def _build_comparison_context(
                     f"submitted_evidence={card.get('evidence_text', '')}",
                     f"source_url={card.get('source_url', '')}",
                     f"source_locator={card.get('source_locator', '')}",
+                    f"measurement={json.dumps({k: card.get(k) for k in ('metric', 'value', 'unit', 'baseline', 'conditions')}, ensure_ascii=False)}",
                     f"original_source={content}",
                 ]
             )
@@ -224,26 +284,90 @@ def _compare_claims_with_sources(
     cards: list[EvidenceCard],
     sources: dict[str, FetchedSource],
 ) -> ClaimComparisonBatch:
-    """D 단계에서 주장과 원문을 구조화 출력으로 비교한다."""
+    """Compare each card against its own source; no cross-card numerical verdicts."""
     llm = get_llm().with_structured_output(ClaimComparisonBatch)
-    prompt = (
+    instruction = (
         "아래 EvidenceCard의 주장과 재확인한 원문을 비교하라.\n"
         "주장을 원문이 직접 뒷받침하면 full, 일부 조건이나 범위만 뒷받침하면 "
         "partial, 뒷받침하지 않으면 none으로 판정하라.\n"
         "원문이 직접 말하지 않은 해석을 fact로 표시했다면 "
         "claim_type_assessment를 should_be_inference로 판정하라.\n"
         "각 evidence_id를 빠짐없이 그대로 반환하라.\n\n"
-        f"검증 입력:\n{_build_comparison_context(cards, sources)}"
     )
-    response = llm.invoke(
+    research_cards = [card for card in cards if not _is_retrieval_limitation(card)]
+    inputs = [
         [
             SystemMessage(content=_load_system_prompt()),
-            HumanMessage(content=prompt),
+            HumanMessage(
+                content=f"{instruction}{_build_comparison_context([card], sources)}"
+            ),
         ]
+        for card in research_cards
+    ]
+    responses = (
+        llm.batch(inputs, config={"max_concurrency": 4}, return_exceptions=True)
+        if inputs
+        else []
     )
-    if isinstance(response, ClaimComparisonBatch):
-        return response
-    return ClaimComparisonBatch.model_validate(response)
+    decisions = [
+        ClaimEvidenceDecision(
+            evidence_id=str(card["evidence_id"]),
+            support_level="none",
+            rationale="검색 발췌의 확인 한계는 원문 자체의 반대 근거가 아니므로 EvidenceCard에서 제외, 조사 limitation으로 유지",
+            claim_type_assessment="should_be_inference",
+        )
+        for card in cards
+        if _is_retrieval_limitation(card)
+    ]
+    for card, response in zip(research_cards, responses, strict=True):
+        evidence_id = str(card["evidence_id"])
+        try:
+            if isinstance(response, Exception):
+                raise response
+            batch = (
+                response
+                if isinstance(response, ClaimComparisonBatch)
+                else ClaimComparisonBatch.model_validate(response)
+            )
+            decision = next(d for d in batch.decisions if d.evidence_id == evidence_id)
+            source = _normalized_text(
+                str(sources.get(evidence_id, {}).get("content", ""))
+            )
+            quotes = decision.matched_quotes or [decision.matched_text]
+            if decision.support_level != "none" and not all(
+                _normalized_text(quote) and _normalized_text(quote) in source
+                for quote in quotes
+            ):
+                decision = decision.model_copy(
+                    update={
+                        "support_level": "none",
+                        "rationale": "반환된 인용문을 해당 카드의 원문에서 찾을 수 없어 재확인 필요",
+                        "matched_text": "",
+                        "matched_quotes": [],
+                    }
+                )
+            if decision.support_level == "full" and card.get("value"):
+
+                def numbers(text):
+                    text = re.sub(r"(?<=\d)\s+(?=[.\d])", "", text)
+                    return {Decimal(n) for n in re.findall(r"\d+(?:\.\d+)?", text)}
+
+                if not numbers(str(card["value"])) <= numbers(" ".join(quotes)):
+                    decision = decision.model_copy(
+                        update={
+                            "support_level": "none",
+                            "rationale": "구조화된 수치가 원문 인용에 없어 제외",
+                        }
+                    )
+        except Exception as error:  # noqa: BLE001 - one judge failure must not discard other cards
+            decision = ClaimEvidenceDecision(
+                evidence_id=evidence_id,
+                support_level="none",
+                rationale=f"개별 원문 대조 실패: {type(error).__name__}",
+                claim_type_assessment="unclear",
+            )
+        decisions.append(decision)
+    return ClaimComparisonBatch(decisions=decisions)
 
 
 def _parse_published_date(value: str) -> date | None:
@@ -316,17 +440,25 @@ def _recheck_original_sources_node(
     limitations = list(state.get("limitations", []))
     errors = list(state.get("errors", []))
     tavily_fallback_ids = list(state.get("tavily_fallback_ids", []))
-    source_cache: dict[str, FetchedSource] = {}
+    source_cache: dict[tuple[str, str], FetchedSource] = {}
 
     for index, card in enumerate(cards, start=1):
         evidence_id = _card_id(card, index)
         if evidence_id not in active_ids:
             continue
         source_url = str(card.get("source_url", "")).strip()
-        source = source_cache.get(source_url)
+        # Split Tasks may cite different pages of the same PDF. Reusing the
+        # first page's text for every locator would discard valid evidence.
+        source_key = (
+            source_url,
+            str(card.get("source_locator", ""))
+            if card.get("source_type") == "paper"
+            else "",
+        )
+        source = source_cache.get(source_key)
         if source is None:
             source = _fetch_original_source(card)
-            source_cache[source_url] = source
+            source_cache[source_key] = source
         sources[evidence_id] = source
         if source.get("fetch_status") == "blocked":
             fallback_content = str(card.get("evidence_text", "")).strip()
@@ -408,6 +540,18 @@ def _compare_claim_and_evidence_node(
     return {
         "decisions": decisions,
         "errors": list(dict.fromkeys(errors)),
+        "limitations": list(
+            dict.fromkeys(
+                [
+                    *state.get("limitations", []),
+                    *(
+                        f"검색 범위의 한계: {card['claim']}"
+                        for card in state.get("cards", [])
+                        if _is_retrieval_limitation(card)
+                    ),
+                ]
+            )
+        ),
     }
 
 
@@ -462,6 +606,10 @@ def _classify_fact_and_inference_node(
             verification_status = "partially_verified"
 
         card["verification_status"] = verification_status
+        if "source_id" in card:
+            card["source_id"] = source_identity(card)
+        if claim_type_assessment == "should_be_inference":
+            card["claim_type"] = "inference"
         rationale = str(decision.get("rationale", "")).strip()
         caveats = [str(card.get("caveat", "")).strip(), rationale, *issues]
         if evidence_id in tavily_fallback_ids:
@@ -497,13 +645,11 @@ def _check_comparison_balance_node(
             perspective_counts[technology].add(str(card.get("perspective", "")))
 
     missing_technologies = [
-        technology
-        for technology, count in technology_counts.items()
-        if count == 0
+        technology for technology, count in technology_counts.items() if count == 0
     ]
-    shared_perspectives = perspective_counts["TurboQuant"] & perspective_counts[
-        "CXL-based"
-    ]
+    shared_perspectives = (
+        perspective_counts["TurboQuant"] & perspective_counts["CXL-based"]
+    )
     balanced = not missing_technologies and bool(shared_perspectives)
     return {
         "balance_result": {
@@ -529,7 +675,11 @@ def _check_verification_pass_node(
 
 def _route_after_verification_check(state: VerificationGraphState) -> str:
     """H 조건 분기: 통과하면 L, 실패하면 I로 이동한다."""
-    return "return_verified_result" if state.get("verification_passed") else "request_revision"
+    return (
+        "return_verified_result"
+        if state.get("verification_passed")
+        else "request_revision"
+    )
 
 
 def _request_revision_node(
@@ -572,7 +722,11 @@ def _check_reverification_available_node(
 
 def _route_after_reverification_check(state: VerificationGraphState) -> str:
     """J 조건 분기: 가능하면 C로 돌아가고 불가능하면 K로 이동한다."""
-    return "recheck_original_sources" if state.get("retry_possible") else "mark_uncertainty"
+    return (
+        "recheck_original_sources"
+        if state.get("retry_possible")
+        else "mark_uncertainty"
+    )
 
 
 def _mark_uncertainty_node(
@@ -586,9 +740,7 @@ def _mark_uncertainty_node(
     ]
     limitations = list(state.get("limitations", []))
     if uncertain_ids:
-        limitations.append(
-            "재검증 후에도 불확실한 근거: " + ", ".join(uncertain_ids)
-        )
+        limitations.append("재검증 후에도 불확실한 근거: " + ", ".join(uncertain_ids))
     if not state.get("balance_result", {}).get("balanced"):
         limitations.append("TurboQuant와 CXL-based 비교 근거의 균형이 부족합니다.")
     return {"limitations": list(dict.fromkeys(limitations))}
@@ -633,8 +785,7 @@ def _return_verified_result_node(
             "retry_count": state.get("retry_count", 0),
             "tavily_fallback_ids": state.get("tavily_fallback_ids", []),
             "uncertain_evidence_ids": [
-                str(card.get("evidence_id", ""))
-                for card in [*partial, *unsupported]
+                str(card.get("evidence_id", "")) for card in [*partial, *unsupported]
             ],
         },
     }
@@ -649,11 +800,15 @@ def build_evidence_verification_graph():
     graph.add_node("recheck_original_sources", _recheck_original_sources_node)  # C
     graph.add_node("compare_claim_and_evidence", _compare_claim_and_evidence_node)  # D
     graph.add_node("evaluate_source_quality", _evaluate_source_quality_node)  # E
-    graph.add_node("classify_fact_and_inference", _classify_fact_and_inference_node)  # F
+    graph.add_node(
+        "classify_fact_and_inference", _classify_fact_and_inference_node
+    )  # F
     graph.add_node("check_comparison_balance", _check_comparison_balance_node)  # G
     graph.add_node("check_verification_pass", _check_verification_pass_node)  # H
     graph.add_node("request_revision", _request_revision_node)  # I
-    graph.add_node("check_reverification_available", _check_reverification_available_node)  # J
+    graph.add_node(
+        "check_reverification_available", _check_reverification_available_node
+    )  # J
     graph.add_node("mark_uncertainty", _mark_uncertainty_node)  # K
     graph.add_node("return_verified_result", _return_verified_result_node)  # L
 
@@ -683,7 +838,9 @@ def build_evidence_verification_graph():
     )
     graph.add_edge("mark_uncertainty", "return_verified_result")
     graph.add_edge("return_verified_result", END)
-    return graph.compile()
+    # Source documents and raw judge output stay local; only the parent node's
+    # compact result is checkpointed for recovery.
+    return graph.compile(checkpointer=False)
 
 
 EVIDENCE_VERIFICATION_GRAPH = build_evidence_verification_graph()
@@ -718,6 +875,9 @@ def _empty_verification_result(summary: str) -> dict[str, Any]:
 
 def evidence_verification_agent(state: GlobalState) -> dict[str, Any]:
     """A 입력을 받아 검증 LangGraph를 실행하고 L 결과를 GlobalState에 반환한다."""
+    if "payload" in state:
+        result = evidence_verification_agent(legacy_view(state))
+        return {"payload": compact_verification(result)}
     cards = [deepcopy(card) for card in state.get("evidence_cards", [])]
     if not cards:
         return {
@@ -747,12 +907,8 @@ def evidence_verification_agent(state: GlobalState) -> dict[str, Any]:
         }
     )
     verification_result = graph_result["verification_result"]
-    verified_cards = verification_result["payload"].get(
-        "verified_evidence_cards", []
-    )
-    partial_cards = verification_result["payload"].get(
-        "partially_verified_cards", []
-    )
+    verified_cards = verification_result["payload"].get("verified_evidence_cards", [])
+    partial_cards = verification_result["payload"].get("partially_verified_cards", [])
     return {
         "verification_result": verification_result,
         "verified_evidence_cards": deepcopy(verified_cards),

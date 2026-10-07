@@ -1,4 +1,4 @@
-# 내부 LangGraph: 순차 처리와 조건부 분기로 구성, 반복 루프 없음.
+# 내부 LangGraph: 생성과 검증, 실제 PDF 페이지 수에 따른 제한된 축약 루프.
 # 정상: START → load_config → prepare_context → generate → validate_sections
 #       → render → validate_report → END
 # 자료 부족: prepare_context → generate → validate_sections → render → END
@@ -24,10 +24,10 @@
 아웃풋:
     {"final_report": str} 형태의 Markdown 문자열 갱신값.
     생성 실패 시에도 같은 문자열 형식으로 안전한 실패 안내 반환.
-    관점별 원본 평가의 재평가, 신규 검색, PDF 생성과 파일 저장 없음.
+    신규 검색 없음. 실제 PDF 렌더링으로 분량을 검사하며 파일 저장은 CLI가 수행.
 
 검증 범위:
-    SUMMARY의 PDF 반 페이지 조건은 별도 PDF 렌더링 단계에서 확인 필요.
+    동적 Workflow의 보고서는 참고문헌을 포함한 실제 A4 PDF 페이지 수 검사.
 
 입출력 형식:
     함수: report_writer_agent(state: GlobalState) -> dict[str, Any]
@@ -73,14 +73,19 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from langgraph.graph import END, START, StateGraph
 from pydantic import BaseModel, ConfigDict, Field
 
+from kv_cache_agent.agents.compat import grounded_worker_results, legacy_view
 from kv_cache_agent.agents.synthesis import (
     _load_config,
     _route_error,
     _validate_numbers,
     _verified_cards,
 )
-from kv_cache_agent.graph.state import GlobalState
+from kv_cache_agent.config import ReportBudget
+from kv_cache_agent.evidence import comparison_context
+from kv_cache_agent.graph.state import LegacyState as GlobalState
 from kv_cache_agent.llm import get_llm
+from kv_cache_agent.observability import record_event
+from kv_cache_agent.tools.pdf_writer import pdf_page_count
 
 PROMPT_PATH = Path(__file__).resolve().parents[1] / "prompts" / "report_writer.yaml"
 TITLES = [
@@ -90,12 +95,10 @@ TITLES = [
     "3. 기술 개요",
     "4. 관점 별 평가",
     "5. 시사점",
-    "6. 한계점",
+    "6. 한계 및 불확실성",
     "REFERENCE",
 ]
-INLINE_EVIDENCE_ARTIFACT = re.compile(
-    r"\s*\(\s*evidence_ids\s*:\s*\[[^\]]*\]\s*\)"
-)
+INLINE_EVIDENCE_ARTIFACT = re.compile(r"\s*\(\s*evidence_ids\s*:\s*\[[^\]]*\]\s*\)")
 INFERENCE_PREFIX = re.compile(r"^\s*(?:추론|해석)\s*:\s*")
 ANALYTICAL_METHOD_NOTE = (
     "자료가 제한된 항목은 확인된 기술 특성, 클라우드 운영 조건과 일반적인 "
@@ -145,7 +148,10 @@ def _missing_section_paragraphs(section_id: str) -> "list[Paragraph]":
             "CXL-Hybrid 메모리 기반 ITME는 GPU에 한정된 메모리 계층을 호스트·확장 메모리까지 연결해 KV cache 수용량을 늘리는 하드웨어 중심 대안으로 볼 수 있다. 클라우드 사업자가 장비 구성과 자원 풀을 설계하는 관점에서 메모리 증설과 자원 공유의 효과를 평가하기에 적합하다.",
             "대신 용량이 늘어나는 것만으로 지연시간이 줄어드는 것은 아니며, CXL 경로의 접근 특성, 캐시 배치 정책, 데이터 이동량과 장애 격리가 성능과 운영성을 결정한다. 따라서 이 기술은 압축 품질보다 계층 관리와 시스템 통합 부담을 핵심 평가 대상으로 만든다.",
         ],
-        "section_2_3": [common, "두 기술을 비교할 때는 서로 다른 논문 실험 수치를 단순히 우열로 연결하기보다, 해결하려는 병목과 필요한 변경 지점을 기준으로 공통 평가 틀을 세워야 한다. 압축으로 줄인 바이트 수와 확장 메모리로 확보한 바이트 수는 같은 효과처럼 보일 수 있지만 지연, 품질, 운영비의 의미는 서로 다르다."],
+        "section_2_3": [
+            common,
+            "두 기술을 비교할 때는 서로 다른 논문 실험 수치를 단순히 우열로 연결하기보다, 해결하려는 병목과 필요한 변경 지점을 기준으로 공통 평가 틀을 세워야 한다. 압축으로 줄인 바이트 수와 확장 메모리로 확보한 바이트 수는 같은 효과처럼 보일 수 있지만 지연, 품질, 운영비의 의미는 서로 다르다.",
+        ],
         "section_3_1": [
             "TurboQuant의 핵심은 KV cache를 더 작은 표현으로 저장해 GPU 메모리 footprint를 줄이고, 그 결과 긴 문맥이나 더 많은 동시 요청을 한 장치에서 수용할 가능성을 높이는 데 있다. 구현에서는 양자화 방식, scale·복원 처리, attention kernel과의 결합 여부가 실제 효과를 좌우한다.",
             "이 방식은 저장량 절감과 메모리 이동량 감소에 유리할 수 있지만, 낮은 정밀도가 attention 결과와 생성 품질에 미치는 영향, 복원·변환 연산의 비용, 모델별 튜닝 필요성을 함께 확인해야 한다. 원문 실험의 모델·장비·부하가 실제 클라우드 환경과 다르면 절대 성능을 그대로 이전하기 어렵다.",
@@ -171,7 +177,10 @@ def _missing_section_paragraphs(section_id: str) -> "list[Paragraph]":
             "클라우드의 짧은 문맥·낮은 동시성 서비스에서는 압축 오버헤드나 CXL 접근 비용이 절감 효과보다 크게 보일 수 있다. 반대로 긴 문맥, 많은 동시 요청, GPU 메모리 부족으로 인한 배치 축소가 빈번한 서비스에서는 두 접근 모두 자원 활용률 개선의 여지가 커진다.",
             "TurboQuant는 품질 허용 범위와 커널 지원을 먼저 확인해야 하고, CXL-Hybrid는 hot·cold 상태 배치와 tail latency 보호 정책을 먼저 확인해야 한다. 비용 평가는 장치 임대료만이 아니라 전력, 운영 인력, 장애 대응, 모델별 튜닝 비용까지 포함해야 한다.",
         ],
-        "section_5_1": [common, "두 접근 모두 단일 요청의 이론적 최대 성능보다 실제 서비스의 메모리 압박과 동시성 변화를 기준으로 평가해야 한다는 점에서 일치한다. 효과를 판단하려면 메모리 용량뿐 아니라 지연시간 분포, 처리량, 품질, 비용을 함께 측정해야 한다."],
+        "section_5_1": [
+            common,
+            "두 접근 모두 단일 요청의 이론적 최대 성능보다 실제 서비스의 메모리 압박과 동시성 변화를 기준으로 평가해야 한다는 점에서 일치한다. 효과를 판단하려면 메모리 용량뿐 아니라 지연시간 분포, 처리량, 품질, 비용을 함께 측정해야 한다.",
+        ],
         "section_5_2": [
             "TurboQuant는 메모리 안에 저장되는 데이터 자체를 줄이는 대신 정확도·추가 연산·호환성의 절충을 만든다. CXL-Hybrid는 원본에 가까운 상태를 더 넓은 계층에 보관할 수 있지만, 원격 접근과 이동 때문에 용량과 지연 사이의 절충을 만든다.",
             "따라서 메모리 비용을 줄이는 방향과 요청 지연을 안정화하는 방향이 항상 일치하지 않는다. 성숙도와 채택 측면에서도 소프트웨어는 배포가 쉬울 수 있지만 검증 부담이 남고, 하드웨어는 구조적 확장성이 있어도 도입 주기와 공급망 의존성이 커질 수 있다.",
@@ -180,7 +189,10 @@ def _missing_section_paragraphs(section_id: str) -> "list[Paragraph]":
             "운영 조건을 바꾸어가며 문맥 길이, 동시 요청 수, KV cache 재사용률, GPU 메모리 여유, 목표 tail latency를 기준으로 두 기술의 손익분기점을 확인해야 한다. 특히 평균 지연만 보면 CXL 계층 이동이나 양자화 오버헤드가 가려질 수 있으므로 p95·p99와 품질 지표를 함께 봐야 한다.",
             "추가 확인 항목은 모델별 품질 영향, 지원 프레임워크와 커널, 실제 장비의 CXL 지연·대역폭, 장애 복구 시간, 요청당 총비용이다. 이 항목을 같은 부하 생성기와 기준 시스템으로 반복 측정하면 공개 자료의 조건 차이를 줄일 수 있다.",
         ],
-        "section_6_1": [common, "공개 자료에 나타난 원리와 실험 결과는 도입 판단의 출발점이지만, 고객별 계약 단가, 실제 채택률, 운영 장애율과 장기 유지보수 비용까지 보여주지는 않는다. 이런 정보는 클라우드 사업자의 내부 계측과 공급자 검증이 추가되어야 한다."],
+        "section_6_1": [
+            common,
+            "공개 자료에 나타난 원리와 실험 결과는 도입 판단의 출발점이지만, 고객별 계약 단가, 실제 채택률, 운영 장애율과 장기 유지보수 비용까지 보여주지는 않는다. 이런 정보는 클라우드 사업자의 내부 계측과 공급자 검증이 추가되어야 한다.",
+        ],
         "section_6_2": [
             "TurboQuant와 CXL-Hybrid 관련 자료는 모델 크기, 문맥 길이, 배치 구성, GPU 세대, 메모리 계층과 기준 구현이 다를 수 있다. 같은 퍼센트 절감이나 처리량 수치라도 출발점과 측정 경로가 다르면 실제 서비스의 효과를 직접 비교할 수 없다.",
             "따라서 공개 수치는 기술이 어떤 방향으로 작동하는지 설명하는 참고값으로 사용하고, 우열 결론은 동일 모델·장비·부하·품질 기준으로 재현한 실험에 두어야 한다. 비교 실험에서는 warm-up, cache hit·miss, tail latency와 실패 복구까지 고정하는 것이 중요하다.",
@@ -196,8 +208,7 @@ def _missing_section_paragraphs(section_id: str) -> "list[Paragraph]":
     }
     texts = by_section.get(section_id, [common, impact])
     return [
-        Paragraph(text=text, claim_type="inference", evidence_ids=[])
-        for text in texts
+        Paragraph(text=text, claim_type="inference", evidence_ids=[]) for text in texts
     ]
 
 
@@ -268,15 +279,75 @@ def _body_sections(config: dict) -> list[dict]:
     ]
 
 
+def _analysis_requirements(result: dict, cards: dict) -> list[dict]:
+    """Protect grounded synthesis reasoning when shortening the report."""
+    targets = {
+        "technical": "section_4_1", "market": "section_4_2",
+        "stakeholder": "section_4_3", "cloud_domain": "section_4_4",
+    }
+    grouped = {}
+    payload = result.get("payload") or {}
+    for row in payload.get("comparison_rows", []):
+        section_id = targets.get(row.get("perspective"))
+        ids = [key for key in row.get("evidence_ids", []) if key in cards]
+        if section_id and ids:
+            grouped.setdefault(section_id, []).append({**row, "evidence_ids": ids})
+    interpretations = [
+        row for row in payload.get("conditional_recommendations", [])
+        if any(key in cards for key in row.get("evidence_ids", []))
+    ]
+    if interpretations:
+        grouped["section_5_3"] = interpretations
+    return [
+        {"section_id": section_id, "grounded_interpretations": rows}
+        for section_id, rows in grouped.items()
+    ]
+
+
+def _missing_analyses(sections: dict, requirements: list[dict], cards: dict) -> list[dict]:
+    """Check linked inference presence; semantic fidelity is judged separately."""
+    missing = []
+    for requirement in requirements:
+        anchors = {
+            key for row in requirement["grounded_interpretations"]
+            for key in row.get("evidence_ids", []) if key in cards
+        }
+        paragraphs = sections.get(requirement["section_id"], [])
+        inference_ids = {
+            key for paragraph in paragraphs if paragraph.claim_type == "inference"
+            for key in paragraph.evidence_ids
+        }
+        technologies = {
+            cards[key].get("technology") for key in anchors
+            if cards[key].get("technology")
+        }
+        # Both technologies need reasoning when the synthesis supports both.
+        groups = [
+            {key for key in anchors if cards[key].get("technology") in {tech, "both"}}
+            for tech in technologies if tech != "both"
+        ] or [anchors]
+        if any(not group.intersection(inference_ids) for group in groups):
+            missing.append(requirement)
+    return missing
+
+
 def _plain(text: str) -> str:
     # LLM 본문이나 외부 메타데이터로 제목, 링크, 인용 번호를 삽입하지 않도록 처리.
     """본문 또는 메타데이터 입력 → 구조용 문자와 줄바꿈 정리 → 표시 문자열 반환."""
     return re.sub(r"[\[\]#<>`*]", "", " ".join(text.split()))
 
 
-def _remove_inline_evidence_artifact(text: str) -> str:
+def _remove_inline_evidence_artifact(text: str, evidence_ids=()) -> str:
     """LLM이 본문에 중복 출력한 구조화 필드와 추론 접두어를 제거한다."""
     cleaned = INLINE_EVIDENCE_ARTIFACT.sub("", text)
+
+    # The structured IDs remain authoritative. Remove only duplicate inline
+    # IDs already attached to this paragraph; unknown references still fail.
+    def remove_duplicate(match):
+        ids = {value.strip() for value in match.group(1).split(",")}
+        return "" if ids and ids <= set(evidence_ids) else match.group(0)
+
+    cleaned = re.sub(r"\[([^]]+)\]", remove_duplicate, cleaned)
     return INFERENCE_PREFIX.sub("", cleaned).strip()
 
 
@@ -285,6 +356,7 @@ def _normalize_sections(
     expected_ids: list[str],
     limitations: list[str],
     allow_uncited_inference: bool = False,
+    expand_short_sections: bool = True,
 ) -> list[Section]:
     """LLM 절 목록을 목차 순서로 정규화하고 누락 절을 보완한다."""
     expected = set(expected_ids)
@@ -329,14 +401,14 @@ def _normalize_sections(
                         evidence_ids=[],
                     )
                 ]
-                limitations.append(f"{section_id}: 보고서 초안에서 절이 누락되어 판단 보류")
-            normalized.append(
-                Section(section_id=section_id, paragraphs=paragraphs)
-            )
+                limitations.append(
+                    f"{section_id}: 보고서 초안에서 절이 누락되어 판단 보류"
+                )
+            normalized.append(Section(section_id=section_id, paragraphs=paragraphs))
             continue
         normalized.append(section)
 
-    if allow_uncited_inference:
+    if allow_uncited_inference and expand_short_sections:
         for section in normalized:
             if len(section.paragraphs) == 1:
                 filler = _missing_section_paragraphs(section.section_id)[-1]
@@ -376,9 +448,11 @@ def _render_markdown(
                 citations = " ".join(
                     f"[{numbers[i]}]" for i in dict.fromkeys(paragraph.evidence_ids)
                 )
-                prefix = {"fact": "", "inference": "", "limitation": "한계: "}[
-                    paragraph.claim_type
-                ]
+                prefix = {
+                    "fact": "",
+                    "inference": "해석: " if config.get("label_inference") else "",
+                    "limitation": "한계: ",
+                }[paragraph.claim_type]
                 lines.extend(
                     [f"{prefix}{_plain(paragraph.text)} {citations}".strip(), ""]
                 )
@@ -386,15 +460,18 @@ def _render_markdown(
     for key, number in numbers.items():
         card = cards[key]
         # 공통 카드 스키마에 저자, 학회, 조회일 필드가 없으므로 임의 보완하지 않음.
-        metadata = ". ".join(
+        date = str(card.get("published_date") or "").strip()
+        metadata_parts = [
             _plain(str(card.get(k) or default))
             for k, default in (
-                ("published_date", "발행일 미상"),
                 ("source_title", "제목 미상"),
                 ("source_locator", "위치 미제공"),
                 ("source_url", "출처 미제공"),
             )
-        )
+        ]
+        if date and date != "발행일 미상":
+            metadata_parts.insert(0, _plain(date))
+        metadata = ". ".join(metadata_parts)
         lines.extend([f"[{number}] {metadata}. 근거 ID: {_plain(key)}", ""])
     if not numbers:
         lines.append("본문에 사용한 검증 근거 없음")
@@ -429,7 +506,7 @@ def _fallback(config: dict, reason: str, limitations: list[str]) -> str:
 
 
 class ReportState(TypedDict, total=False):
-    """보고서 서브그래프 전용 상태. final_report 외의 내부 값은 외부 반환 금지."""
+    """초안은 로컬에만 보관. 부모에는 보고서와 작은 분량 통계만 전달."""
 
     request: GlobalState
     config: dict[str, Any]
@@ -444,6 +521,14 @@ class ReportState(TypedDict, total=False):
     markdown: str
     error_type: str
     output: dict[str, str]
+    length_rewrite_count: int
+    page_count: int
+    target_body_chars: int
+    length_feedback: dict[str, Any]
+    length_decision: str
+    analysis_rewrite_count: int
+    analysis_feedback: dict[str, Any]
+    analysis_decision: str
 
 
 def _report_guard(node):
@@ -490,7 +575,21 @@ def _report_guard(node):
 @_report_guard
 def _load_report_config(local: ReportState) -> dict:
     """입력: 내부 상태 → 처리: YAML과 목차 검사 → 출력: config."""
-    return {"config": _load_prompt_config()}
+    config = _load_prompt_config()
+    config["label_inference"] = "dynamic_worker_results" in local["request"]
+    config["compact_report"] = "dynamic_worker_results" in local["request"]
+    budget = ReportBudget.from_env()
+    config["length_budget"] = {
+        "max_pdf_pages": budget.max_pdf_pages,
+        "max_length_rewrites": budget.max_length_rewrites,
+        "max_analysis_rewrites": budget.max_analysis_rewrites,
+    }
+    return {
+        "config": config,
+        "length_rewrite_count": 0,
+        "analysis_rewrite_count": 0,
+        "target_body_chars": budget.target_body_chars,
+    }
 
 
 @_report_guard
@@ -543,12 +642,20 @@ def _generate_sections(local: ReportState) -> dict:
     result = local["result"]
     context = {
         "user_query": state.get("user_query", ""),
+        "worker_results": grounded_worker_results(state, cards),
+        "quality_feedback": state.get("quality_feedback", {}),
+        "previous_report": state.get("final_report", ""),
         "synthesis_result": result,
         "evidence_cards": list(cards.values()),
+        "measurement_comparisons": comparison_context(list(cards.values())),
         "perspective_results": {
             perspective: {
                 "status": state.get(f"{perspective}_result", {}).get("status"),
-                "summary": state.get(f"{perspective}_result", {}).get("summary", ""),
+                "summary": "\n".join(
+                    card["claim"]
+                    for card in cards.values()
+                    if card.get("perspective") == perspective
+                ),
                 "limitations": state.get(f"{perspective}_result", {}).get(
                     "limitations", []
                 ),
@@ -570,12 +677,25 @@ def _generate_sections(local: ReportState) -> dict:
         ],
         "research_plan": state.get("research_plan", {}),
         "report_structure": config["report_structure"],
-        "required_section_ids": [
-            section["id"] for section in _body_sections(config)
-        ],
+        "required_section_ids": [section["id"] for section in _body_sections(config)],
         "reference_formats": config.get("reference_formats", {}),
         "summary_layout_target": config.get("summary_layout_target", {}),
+        "length_budget": {
+            **config["length_budget"],
+            "target_body_chars": local.get("target_body_chars", 15000),
+            "references_included_in_page_limit": True,
+        },
+        "length_feedback": local.get("length_feedback", {}),
+        "analysis_requirements": _analysis_requirements(result, cards),
+        "analysis_feedback": local.get("analysis_feedback", {}),
     }
+    if config.get("compact_report"):
+        context["inference_detail_rules"] = [
+            "각 핵심 관점은 확인된 근거, 판단의 이유와 운영상 의미, 적용 조건을 설명한다.",
+            "시장성은 수요와 도입 장벽, 이해관계자는 역할과 부담, 도메인은 병목별 효과와 위험을 해석한다.",
+            "사실과 한계 사이의 근거 기반 inference 문단을 보존한다. 남는 분량은 해석의 깊이에 사용한다.",
+            "중복된 원리와 일반론을 줄이고 근거 없는 사실이나 수치를 만들지 않는다.",
+        ]
     response = (
         get_llm()
         .with_structured_output(ReportDraft)
@@ -597,13 +717,17 @@ def _validate_sections(local: ReportState) -> dict:
     outline = _body_sections(local["config"])
     draft = ReportDraft.model_validate(response)
     allow_uncited_inference = local.get("allow_uncited_inference", False)
+    compact = local["config"].get("compact_report", False)
     # 근거는 evidence_ids 필드로만 관리하고, 본문에 중복된 내부 표기는 제거한다.
     for section in draft.sections:
         for paragraph in section.paragraphs:
-            paragraph.text = _remove_inline_evidence_artifact(paragraph.text)
+            paragraph.text = _remove_inline_evidence_artifact(
+                paragraph.text, set(paragraph.evidence_ids) & cards.keys()
+            )
     expected = [s["id"] for s in outline]
     sections_to_validate = _normalize_sections(
-        draft, expected, limitations, allow_uncited_inference
+        draft, expected, limitations, allow_uncited_inference,
+        expand_short_sections=not local["config"].get("compact_report"),
     )
     for section in sections_to_validate:
         for paragraph in section.paragraphs:
@@ -621,37 +745,63 @@ def _validate_sections(local: ReportState) -> dict:
                 raise ValueError("Unknown citation")
             # 불충분한 종합 결과에서는 LLM의 문장을 모두 추론으로 다뤄
             # 보고서 생성이 수치·관점 표현의 작은 차이로 중단되지 않게 한다.
-            if allow_uncited_inference and paragraph.claim_type == "fact":
+            if allow_uncited_inference and paragraph.claim_type == "fact" and not compact:
                 paragraph.claim_type = "inference"
             if (
                 paragraph.claim_type != "limitation"
                 and not paragraph.evidence_ids
                 and not (
-                    allow_uncited_inference
-                    and paragraph.claim_type == "inference"
+                    allow_uncited_inference and paragraph.claim_type == "inference"
                 )
             ):
                 raise ValueError("Uncited assertion")
             if paragraph.claim_type == "fact" and any(
-                cards[evidence_id].get("verification_status")
-                == "partially_verified"
+                cards[evidence_id].get("verification_status") == "partially_verified"
                 for evidence_id in paragraph.evidence_ids
             ):
-                raise ValueError(
-                    "Partially verified evidence cannot support fact"
-                )
-            if paragraph.claim_type != "limitation" and not allow_uncited_inference:
+                raise ValueError("Partially verified evidence cannot support fact")
+            if paragraph.claim_type != "limitation" and (
+                not allow_uncited_inference or (compact and paragraph.evidence_ids)
+            ):
                 _validate_numbers(paragraph.text, paragraph.evidence_ids, cards)
             if not paragraph.text.strip() or re.search(
                 r"\[[^]]+\]|^\s*#", paragraph.text
             ):
                 raise ValueError("Inline citation or heading is not permitted")
     sections = {s.section_id: s.paragraphs for s in sections_to_validate}
+    if compact:
+        missing = _missing_analyses(
+            sections, _analysis_requirements(local["result"], cards), cards
+        )
+        count = local.get("analysis_rewrite_count", 0)
+        decision = "revise" if missing else "done"
+        if missing and count >= local["config"]["length_budget"]["max_analysis_rewrites"]:
+            decision = "error"
+        record_event(
+            local["request"].get("control", {}).get("trace_id", ""),
+            "report_analysis_check", decision,
+            "Preserve cited inference for each supported perspective and technology",
+            missing_sections=[row["section_id"] for row in missing],
+            analysis_rewrite_count=count,
+        )
+        if missing:
+            update = {"analysis_decision": decision, "sections": sections}
+            if decision == "error":
+                update["error_type"] = "report_analysis_missing"
+            else:
+                update.update({
+                    "analysis_rewrite_count": count + 1,
+                    "analysis_feedback": {
+                        "missing_interpretations": missing,
+                        "instruction": "누락된 근거 기반 해석과 원인, 운영 영향을 복원한다.",
+                    },
+                })
+            return update
     # 반복적인 문단별 표시는 제거하되, 보고서의 분석 방식은 한 번 명시한다.
     if allow_uncited_inference and not any(
-            paragraph.text == ANALYTICAL_METHOD_NOTE
-            for paragraph in sections["section_6_4"]
-        ):
+        paragraph.text == ANALYTICAL_METHOD_NOTE
+        for paragraph in sections["section_6_4"]
+    ):
         sections["section_6_4"].append(
             Paragraph(
                 text=ANALYTICAL_METHOD_NOTE,
@@ -659,16 +809,28 @@ def _validate_sections(local: ReportState) -> dict:
                 evidence_ids=[],
             )
         )
-    # 상류에서 확인한 자료 부족은 LLM의 누락 여부와 무관하게 보고서에 보존.
+    # 원시 한계는 입력/체크포인트에 보존한다. 독자에게는 6장의 주제별 요약을
+    # 제공하며 작업 ID와 검증 로그를 본문에 다시 붙이지 않는다.
     if limitations:
         sections["section_6_4"].append(
             Paragraph(
-                text=" / ".join(limitations),
+                text=(
+                    "원문 확인과 검증 범위가 제한된 자료는 확정 사실에서 제외했다. "
+                    "자료별 불확실성과 추가 확인 사항은 위의 한계 항목에 요약했다."
+                    if local["config"].get("compact_report")
+                    else " / ".join(limitations)
+                ),
                 claim_type="limitation",
                 evidence_ids=[],
             )
         )
-    return {"sections": sections}
+    return {"sections": sections, "analysis_decision": "done"}
+
+
+def _route_analysis_check(local: ReportState) -> str:
+    if local.get("error_type"):
+        return "error"
+    return local.get("analysis_decision", "done")
 
 
 @_report_guard
@@ -685,7 +847,49 @@ def _validate_report(local: ReportState) -> dict:
     markdown = local["markdown"]
     if re.findall(r"^# (.+)$", markdown, re.MULTILINE) != TITLES:
         raise ValueError("Rendered outline mismatch")
-    return {"output": {"final_report": markdown}}
+    if not local["config"].get("compact_report"):
+        return {"output": {"final_report": markdown}, "length_decision": "done"}
+    pages = pdf_page_count(markdown)
+    budget = local["config"]["length_budget"]
+    rewrites = local.get("length_rewrite_count", 0)
+    fits = pages <= budget["max_pdf_pages"]
+    decision = "done" if fits else "shorten"
+    if not fits and rewrites >= budget["max_length_rewrites"]:
+        decision = "error"
+    record_event(
+        local["request"].get("control", {}).get("trace_id", ""),
+        "report_length_check", decision,
+        "A4 PDF page count includes references; preserve citations and conditions",
+        page_count=pages, max_pages=budget["max_pdf_pages"],
+        length_rewrite_count=rewrites,
+    )
+    update = {"page_count": pages, "length_decision": decision}
+    if fits:
+        update["output"] = {"final_report": markdown}
+    elif decision == "error":
+        update["error_type"] = "report_page_limit_exceeded"
+    else:
+        target = max(500, int(
+            local["target_body_chars"] * budget["max_pdf_pages"] / pages * 0.8
+        ))
+        update.update({
+            "length_rewrite_count": rewrites + 1,
+            "target_body_chars": target,
+            "length_feedback": {
+                "previous_page_count": pages,
+                "max_pages": budget["max_pdf_pages"],
+                "target_body_chars": target,
+                "previous_draft": markdown,
+                "instruction": "중복을 줄이고 중요한 근거, 비교 조건, 불확실성을 보존한다.",
+            },
+        })
+    return update
+
+
+def _route_report_budget(local: ReportState) -> str:
+    if local.get("error_type"):
+        return "error"
+    return local.get("length_decision", "done")
 
 
 @_report_guard
@@ -728,20 +932,40 @@ def build_report_graph():
     for source, target in (
         ("load_config", "prepare_context"),
         ("generate", "validate_sections"),
-        ("validate_sections", "render"),
         ("render", "validate_report"),
         ("fallback", "validate_report"),
-        ("validate_report", END),
     ):
         graph.add_conditional_edges(
             source, _route_error, {"next": target, "error": "failure"}
         )
     graph.add_edge("failure", END)
-    return graph.compile()
+    graph.add_conditional_edges(
+        "validate_sections", _route_analysis_check,
+        {"done": "render", "revise": "generate", "error": "failure"},
+    )
+    graph.add_conditional_edges(
+        "validate_report", _route_report_budget,
+        {"done": END, "shorten": "generate", "error": "failure"},
+    )
+    # Only the rendered report is persisted by the parent workflow.
+    return graph.compile(checkpointer=False)
 
 
 def report_writer_agent(state: GlobalState) -> dict[str, Any]:
     """GlobalState를 내부 그래프에 전달하고 final_report 문자열만 반환."""
+    if "payload" in state:
+        result = build_report_graph().invoke({"request": legacy_view(state)})
+        return {"payload": {
+            "report": result["output"]["final_report"],
+            "report_metrics": {
+                "pdf_page_count": result.get("page_count"),
+                "max_pdf_pages": result.get("config", {}).get(
+                    "length_budget", {}
+                ).get("max_pdf_pages"),
+                "length_rewrite_count": result.get("length_rewrite_count", 0),
+                "analysis_rewrite_count": result.get("analysis_rewrite_count", 0),
+            },
+        }}
     try:
         result = build_report_graph().invoke({"request": deepcopy(state)})
         return result["output"]

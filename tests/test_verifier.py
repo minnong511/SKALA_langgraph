@@ -1,5 +1,6 @@
 from copy import deepcopy
 from pathlib import Path
+from unittest.mock import Mock
 
 import yaml
 
@@ -11,11 +12,7 @@ from kv_cache_agent.agents.verifier import (
 )
 
 PROMPT_PATH = (
-    Path(__file__).parents[1]
-    / "src"
-    / "kv_cache_agent"
-    / "prompts"
-    / "verifier.yaml"
+    Path(__file__).parents[1] / "src" / "kv_cache_agent" / "prompts" / "verifier.yaml"
 )
 
 
@@ -157,12 +154,14 @@ def test_verifier_returns_common_result_and_verified_cards(monkeypatch) -> None:
     assert agent_result["status"] == "ok"
     assert len(agent_result["evidence_ids"]) == 2
     assert len(agent_result["payload"]["verified_evidence_cards"]) == 2
-    assert result["verified_evidence_cards"] == agent_result["payload"][
-        "verified_evidence_cards"
-    ]
-    assert result["usable_evidence_cards"] == agent_result["payload"][
-        "verified_evidence_cards"
-    ]
+    assert (
+        result["verified_evidence_cards"]
+        == agent_result["payload"]["verified_evidence_cards"]
+    )
+    assert (
+        result["usable_evidence_cards"]
+        == agent_result["payload"]["verified_evidence_cards"]
+    )
     assert agent_result["payload"]["partially_verified_cards"] == []
     assert agent_result["payload"]["unsupported_cards"] == []
     assert agent_result["payload"]["retry_count"] == 0
@@ -197,9 +196,10 @@ def test_verifier_uses_tavily_excerpt_as_partial_fallback(monkeypatch) -> None:
         "원문 접근 차단" in card["caveat"]
         for card in agent_result["payload"]["partially_verified_cards"]
     )
-    assert result["usable_evidence_cards"] == agent_result["payload"][
-        "partially_verified_cards"
-    ]
+    assert (
+        result["usable_evidence_cards"]
+        == agent_result["payload"]["partially_verified_cards"]
+    )
     assert any("Tavily 검색 요약" in item for item in agent_result["limitations"])
 
 
@@ -324,3 +324,162 @@ def test_verifier_prompt_uses_required_yaml_format() -> None:
     assert prompt["constraints"]["fixed_graph_flow"] is True
     assert prompt["constraints"]["maximum_retries"] == 1
     assert prompt["constraints"]["require_original_source_check"] is True
+
+
+def test_verifier_fetches_distinct_pdf_locators_separately(monkeypatch):
+    cards = _sample_cards()
+    for card, page in zip(cards, ("p. 1", "p. 9"), strict=True):
+        card.update(
+            source_url="data/papers/shared.pdf",
+            source_type="paper",
+            source_locator=page,
+        )
+    calls = []
+
+    def source(card):
+        calls.append(card["source_locator"])
+        return {**_fake_source(card), "content": card["source_locator"]}
+
+    def compare(cards, sources):
+        assert all(
+            sources[c["evidence_id"]]["content"] == c["source_locator"] for c in cards
+        )
+        return _full_support(cards, sources)
+
+    monkeypatch.setattr(verifier, "_fetch_original_source", source)
+    monkeypatch.setattr(verifier, "_compare_claims_with_sources", compare)
+    result = evidence_verification_agent({"evidence_cards": cards})
+    assert calls == ["p. 1", "p. 9"]
+    assert result["verification_result"]["status"] == "ok"
+
+
+def test_pdf_locator_selects_sparse_pages_and_ignores_table_numbers(monkeypatch):
+    reader = Mock()
+    reader.pages = [Mock() for _ in range(10)]
+    for index, page in enumerate(reader.pages, 1):
+        page.extract_text.return_value = f"unique-page-{index}"
+    monkeypatch.setattr(verifier, "PdfReader", lambda _: reader)
+    text = verifier._extract_pdf_pages(Path("paper.pdf"), "p. 2; p. 10; Table 4")
+    assert "unique-page-2" in text and "unique-page-10" in text
+    assert "unique-page-4" not in text and "unique-page-9" not in text
+    text = verifier._extract_pdf_pages(Path("paper.pdf"), "pp. 2-4")
+    assert all(f"unique-page-{i}" in text for i in (2, 3, 4))
+    assert "unique-page-5" not in text
+
+
+def test_source_excerpt_includes_numeric_evidence_beyond_prefix():
+    text = (
+        "intro " * 3000
+        + "Compared with NVMe-oF, achieves a 1 .80× throughput improvement."
+    )
+    card = {
+        "claim": "NVMe-oF 대비 1.80배",
+        "evidence_text": "1.80× throughput improvement",
+    }
+    excerpt = verifier._source_excerpt(card, text)
+    assert "1 .80× throughput improvement" in excerpt
+    assert len(excerpt) <= verifier.MAX_SOURCE_CHARS_PER_CARD
+
+
+def test_source_excerpt_includes_integer_batch_and_latency_metrics():
+    text = (
+        "intro " * 3000
+        + "For PC-CXL the batch size is 57. The latency ranges from 55 to 336ms."
+    )
+    card = {
+        "claim": "최대 배치 크기 57, TTFT 55–336ms",
+        "evidence_text": "30% increase",
+    }
+    excerpt = verifier._source_excerpt(card, text)
+    assert "batch size is 57" in excerpt
+    assert "55 to 336ms" in excerpt
+
+
+def test_comparisons_isolate_sources_and_reject_cross_source_quotes(monkeypatch):
+    cards = _sample_cards()
+    cards[0]["evidence_text"] = "NVMe-oF throughput improves by 1.80×."
+    cards[1]["evidence_text"] = "CPU offloading throughput improves by 35.7%."
+    sources = {str(c["evidence_id"]): _fake_source(c) for c in cards}
+    # PDF typography differs, but the literal quote should still be recognized.
+    sources[str(cards[0]["evidence_id"])]["content"] = (
+        "NVMe-oF throughput improves by 1 .80×."
+    )
+    batch = _full_support(cards, sources)
+    batch.decisions[1].matched_text = str(cards[0]["evidence_text"])
+    llm = Mock()
+    llm.with_structured_output.return_value.batch.return_value = [
+        ClaimComparisonBatch(decisions=[d]) for d in batch.decisions
+    ]
+    monkeypatch.setattr(verifier, "get_llm", lambda: llm)
+    result = verifier._compare_claims_with_sources(cards, sources)
+    inputs = llm.with_structured_output.return_value.batch.call_args.args[0]
+    assert "35.7%" not in inputs[0][1].content
+    assert "NVMe-oF" not in inputs[1][1].content
+    assert result.decisions[0].support_level == "full"
+    assert result.decisions[1].support_level == "none"
+    assert result.decisions[1].matched_text == ""
+
+
+def test_single_comparison_exception_keeps_other_card_results(monkeypatch):
+    cards = _sample_cards()
+    sources = {str(c["evidence_id"]): _fake_source(c) for c in cards}
+    llm = Mock()
+    llm.with_structured_output.return_value.batch.return_value = [
+        _full_support(cards[:1], sources),
+        RuntimeError("SECRET provider body"),
+    ]
+    monkeypatch.setattr(verifier, "get_llm", lambda: llm)
+    result = verifier._compare_claims_with_sources(cards, sources)
+    assert [d.support_level for d in result.decisions] == ["full", "none"]
+    assert "SECRET" not in result.model_dump_json()
+
+
+def test_multiple_quotes_must_all_belong_to_the_same_source(monkeypatch):
+    cards = _sample_cards()[:1]
+    sources = {
+        str(cards[0]["evidence_id"]): {
+            **_fake_source(cards[0]),
+            "content": "Prefetching overlaps data transfer. Intervening text. NVMe-oF throughput improves by 1.80×.",
+        }
+    }
+    decision = _full_support(cards, sources).decisions[0]
+    decision.matched_quotes = [
+        "Prefetching overlaps data transfer.",
+        "NVMe-oF throughput improves by 1.80×.",
+    ]
+    llm = Mock()
+    llm.with_structured_output.return_value.batch.return_value = [
+        ClaimComparisonBatch(decisions=[decision])
+    ]
+    monkeypatch.setattr(verifier, "get_llm", lambda: llm)
+    assert (
+        verifier._compare_claims_with_sources(cards, sources).decisions[0].support_level
+        == "full"
+    )
+    decision.matched_quotes[1] = "CPU-offload throughput improves by 35.7%."
+    assert (
+        verifier._compare_claims_with_sources(cards, sources).decisions[0].support_level
+        == "none"
+    )
+
+
+def test_retrieval_absence_is_a_limitation_and_cannot_be_fact_evidence(monkeypatch):
+    card = _sample_cards()[1]
+    card["claim"] = (
+        "검색된 발췌만으로는 NVMe-oF 대비 1.80배 처리량 주장을 검증할 수 없다."
+    )
+    llm = Mock()
+    monkeypatch.setattr(verifier, "get_llm", lambda: llm)
+    result = verifier._compare_claims_with_sources(
+        [card], {str(card["evidence_id"]): _fake_source(card)}
+    )
+    llm.with_structured_output.return_value.batch.assert_not_called()
+    assert result.decisions[0].support_level == "none"
+    update = verifier._compare_claim_and_evidence_node(
+        {
+            "cards": [card],
+            "active_evidence_ids": [str(card["evidence_id"])],
+            "source_documents": {str(card["evidence_id"]): _fake_source(card)},
+        }
+    )
+    assert card["claim"] in update["limitations"][0]

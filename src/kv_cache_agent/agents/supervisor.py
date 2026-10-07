@@ -5,7 +5,7 @@ from typing import Any, TypedDict
 
 import yaml
 
-from kv_cache_agent.graph.state import GlobalState
+from kv_cache_agent.graph.state import LegacyState as GlobalState
 from kv_cache_agent.schemas.outputs import ResearchPlan
 
 PROMPT_PATH = Path(__file__).resolve().parents[1] / "prompts" / "supervisor.yaml"
@@ -52,9 +52,7 @@ def _load_supervisor_config() -> SupervisorConfig:
         )
 
     if set(technologies) != EXPECTED_TECHNOLOGIES:
-        raise ValueError(
-            "technologies에는 TurboQuant와 CXL-based만 정의해야 합니다."
-        )
+        raise ValueError("technologies에는 TurboQuant와 CXL-based만 정의해야 합니다.")
 
     if not isinstance(perspectives, list) or not all(
         isinstance(item, str) and item.strip() for item in perspectives

@@ -2,8 +2,10 @@
 
 import re
 from html import escape
+from io import BytesIO
 from pathlib import Path
 
+from pypdf import PdfReader
 from reportlab.lib import colors
 from reportlab.lib.enums import TA_CENTER, TA_LEFT
 from reportlab.lib.pagesizes import A4
@@ -13,6 +15,7 @@ from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
 from reportlab.platypus import (
     HRFlowable,
+    KeepTogether,
     Paragraph,
     SimpleDocTemplate,
 )
@@ -147,6 +150,8 @@ def _markdown_to_flowables(markdown_text: str, styles: dict[str, ParagraphStyle]
     """현재 보고서 Markdown의 제목·본문·목록을 ReportLab 요소로 변환한다."""
     flowables = []
     paragraph_lines: list[str] = []
+    in_references = False
+    reference_heading = []
 
     def flush_paragraph() -> None:
         if not paragraph_lines:
@@ -155,7 +160,17 @@ def _markdown_to_flowables(markdown_text: str, styles: dict[str, ParagraphStyle]
         style = _paragraph_style(text, styles)
         if text.startswith("- "):
             text = "- " + text[2:].lstrip()
-        flowables.append(Paragraph(_clean_inline_markdown(text), style))
+        paragraph = Paragraph(_clean_inline_markdown(text), style)
+        # Keep each reference's source and Evidence ID on the same page.
+        if reference_heading:
+            flowables.append(KeepTogether([*reference_heading, paragraph]))
+            reference_heading.clear()
+        else:
+            flowables.append(
+                KeepTogether([paragraph])
+                if in_references and re.match(r"^\[\d+\]", text)
+                else paragraph
+            )
         paragraph_lines.clear()
 
     for raw_line in markdown_text.splitlines():
@@ -165,15 +180,19 @@ def _markdown_to_flowables(markdown_text: str, styles: dict[str, ParagraphStyle]
             continue
         if line.startswith("# "):
             flush_paragraph()
-            flowables.append(Paragraph(_clean_inline_markdown(line[2:]), styles["h1"]))
-            flowables.append(
-                HRFlowable(
+            in_references = line[2:] == "REFERENCE"
+            heading = Paragraph(_clean_inline_markdown(line[2:]), styles["h1"])
+            rule = HRFlowable(
                     width="100%",
                     thickness=0.5,
                     color=colors.HexColor("#D6E2EA"),
                     spaceAfter=7,
-                )
             )
+            rule.keepWithNext = True
+            if in_references:
+                reference_heading.extend([heading, rule])
+            else:
+                flowables.extend([heading, rule])
             continue
         if line.startswith("## "):
             flush_paragraph()
@@ -182,6 +201,7 @@ def _markdown_to_flowables(markdown_text: str, styles: dict[str, ParagraphStyle]
         paragraph_lines.append(line)
 
     flush_paragraph()
+    flowables.extend(reference_heading)
     return flowables
 
 
@@ -203,17 +223,20 @@ def _draw_footer(font_name: str):
     return draw
 
 
-def write_pdf(markdown_text: str, output_path: str | Path) -> Path:
-    """Markdown 보고서를 한국어 PDF로 저장하고 생성 경로를 반환한다."""
+class ReportPageLimitError(ValueError):
+    """No oversized PDF is published or silently truncated."""
+
+
+def render_pdf(markdown_text: str) -> bytes:
+    """Use the same A4 layout for both budgeting and the final artifact."""
     if not markdown_text.strip():
         raise ValueError("PDF로 변환할 보고서 내용이 없습니다.")
 
-    output = Path(output_path)
-    output.parent.mkdir(parents=True, exist_ok=True)
+    buffer = BytesIO()
     font_name = _register_korean_font()
     styles = _styles(font_name)
     document = SimpleDocTemplate(
-        str(output),
+        buffer,
         pagesize=A4,
         rightMargin=18 * mm,
         leftMargin=18 * mm,
@@ -226,4 +249,24 @@ def write_pdf(markdown_text: str, output_path: str | Path) -> Path:
     if not story:
         raise ValueError("PDF로 변환할 본문 요소가 없습니다.")
     document.build(story, onFirstPage=_draw_footer(font_name), onLaterPages=_draw_footer(font_name))
+    return buffer.getvalue()
+
+
+def pdf_page_count(markdown_text: str) -> int:
+    return len(PdfReader(BytesIO(render_pdf(markdown_text))).pages)
+
+
+def write_pdf(
+    markdown_text: str, output_path: str | Path, *, max_pages: int = 10
+) -> Path:
+    """Render completely, check actual pages, then publish without truncation."""
+    if max_pages < 1:
+        raise ValueError("max_pages must be positive")
+    data = render_pdf(markdown_text)
+    pages = len(PdfReader(BytesIO(data)).pages)
+    if pages > max_pages:
+        raise ReportPageLimitError(f"PDF has {pages} pages; limit is {max_pages}")
+    output = Path(output_path)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_bytes(data)
     return output

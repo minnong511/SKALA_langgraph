@@ -4,8 +4,10 @@ from typing import Literal
 
 from pydantic import BaseModel, Field
 
+from kv_cache_agent.schemas.measurement import MeasurementFields
 
-class TechnicalFinding(BaseModel):
+
+class TechnicalFinding(MeasurementFields):
     """검색된 논문 chunk를 근거로 작성한 기술 주장."""
 
     technology: Literal["TurboQuant", "CXL-based", "both", "general"]

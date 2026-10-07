@@ -87,8 +87,133 @@ def mock_llm(monkeypatch, reply):
     return loader, llm
 
 
+def test_compact_report_shortens_and_retains_citation_conditions(state, monkeypatch):
+    state["dynamic_worker_results"] = []
+    state["control"] = {"trace_id": "readable-test"}
+    state["synthesis_result"]["limitations"].append("r0-internal: SECRET_DIAGNOSTIC")
+    reply = response(state)
+    reply["sections"][0]["paragraphs"][0]["text"] = "기준선과 장비가 달라 직접 비교할 수 없다."
+    _, llm = mock_llm(monkeypatch, reply)
+    counts = Mock(side_effect=[12, 8])
+    monkeypatch.setattr(module, "pdf_page_count", counts)
+    events = list(module.build_report_graph().stream({"request": state}, stream_mode="updates"))
+    names = [name for event in events for name in event]
+    assert names.count("generate") == 2
+    assert names[-1] == "validate_report"
+    report = events[-1]["validate_report"]["output"]["final_report"]
+    assert "기준선과 장비가 달라 직접 비교할 수 없다." in report
+    assert "근거 ID: " + state["evidence_cards"][2]["evidence_id"] in report
+    assert "SECRET_DIAGNOSTIC" not in report
+    contexts = [json.loads(call.args[0][1].content) for call in llm.with_structured_output.return_value.invoke.call_args_list]
+    assert contexts[1]["length_feedback"]["previous_page_count"] == 12
+    assert contexts[1]["length_budget"]["target_body_chars"] < contexts[0]["length_budget"]["target_body_chars"]
+
+
+def test_compact_report_stops_when_shortening_never_fits(state, monkeypatch):
+    state["dynamic_worker_results"] = []
+    monkeypatch.setenv("MAX_LENGTH_REWRITES", "2")
+    _, llm = mock_llm(monkeypatch, response(state))
+    monkeypatch.setattr(module, "pdf_page_count", Mock(return_value=11))
+    result = module.build_report_graph().invoke({"request": state})
+    assert llm.with_structured_output.return_value.invoke.call_count == 3
+    assert result["length_rewrite_count"] == 2
+    assert "report_page_limit_exceeded" in result["output"]["final_report"]
+
+
+def test_compact_report_preserves_verified_fact_and_rejects_invented_number(state, monkeypatch):
+    state["dynamic_worker_results"] = []
+    reply = response(state)
+    paragraph = reply["sections"][0]["paragraphs"][0]
+    paragraph["claim_type"] = "fact"
+    mock_llm(monkeypatch, reply)
+    result = module.build_report_graph().invoke({"request": state})
+    assert result["sections"]["summary"][0].claim_type == "fact"
+    paragraph["text"] = "처리량은 98765% 증가했다."
+    mock_llm(monkeypatch, reply)
+    assert "fabricated_number" in module.report_writer_agent(state)["final_report"]
+
+
+@pytest.mark.parametrize("mode", ["facts_only", "one_technology"])
+def test_market_interpretation_loss_triggers_restoration(state, monkeypatch, mode):
+    state["dynamic_worker_results"] = []
+    state["control"] = {"trace_id": "analysis-restoration-test"}
+    cards = state["evidence_cards"]
+    ids = [next(c["evidence_id"] for c in cards if c["technology"] == tech)
+           for tech in ("TurboQuant", "CXL-based")]
+    state["synthesis_result"]["payload"] = {"comparison_rows": [{
+        "perspective": "market", "claim_type": "inference", "evidence_ids": ids,
+        "text": "메모리 용량의 제약은 수요로 이어질 수 있지만 통합 비용의 확인이 필요하다.",
+    }]}
+    initial = response(state)
+    restored = deepcopy(initial)
+    before = next(s for s in initial["sections"] if s["section_id"] == "section_4_2")
+    after = next(s for s in restored["sections"] if s["section_id"] == "section_4_2")
+    before["paragraphs"] = [{
+        "text": "연구 구현이 확인됐다.", "claim_type": "fact", "evidence_ids": ids,
+    }, {"text": "가격과 고객 도입 정보는 미확인이다.", "claim_type": "limitation", "evidence_ids": []}]
+    if mode == "one_technology":
+        before["paragraphs"].append({
+            "text": "메모리 압박을 완화할 가능성이 있다.",
+            "claim_type": "inference", "evidence_ids": ids[:1],
+        })
+    after["paragraphs"] = [*deepcopy(before["paragraphs"]), {
+        "text": state["synthesis_result"]["payload"]["comparison_rows"][0]["text"],
+        "claim_type": "inference", "evidence_ids": ids,
+    }]
+    _, llm = mock_llm(monkeypatch, initial)
+    llm.with_structured_output.return_value.invoke.side_effect = [initial, restored]
+    monkeypatch.setattr(module, "pdf_page_count", Mock(return_value=9))
+    result = module.build_report_graph().invoke({"request": state})
+    assert result["analysis_rewrite_count"] == 1
+    assert result["page_count"] == 9
+    assert "수요로 이어질 수 있지만 통합 비용" in result["output"]["final_report"]
+    calls = llm.with_structured_output.return_value.invoke.call_args_list
+    feedback = json.loads(calls[1].args[0][1].content)["analysis_feedback"]
+    assert feedback["missing_interpretations"][0]["section_id"] == "section_4_2"
+
+
+def test_missing_interpretation_retry_is_bounded(state, monkeypatch):
+    state["dynamic_worker_results"] = []
+    key = state["evidence_cards"][0]["evidence_id"]
+    state["synthesis_result"]["payload"] = {"comparison_rows": [{
+        "perspective": "market", "evidence_ids": [key], "text": "조건부 수요 해석",
+    }]}
+    draft = response(state)
+    section = next(s for s in draft["sections"] if s["section_id"] == "section_4_2")
+    section["paragraphs"] = [{"text": "자료 부족", "claim_type": "limitation", "evidence_ids": []}]
+    _, llm = mock_llm(monkeypatch, draft)
+    monkeypatch.setenv("MAX_ANALYSIS_REWRITES", "2")
+    result = module.build_report_graph().invoke({"request": state})
+    assert llm.with_structured_output.return_value.invoke.call_count == 3
+    assert result["analysis_rewrite_count"] == 2
+    assert "report_analysis_missing" in result["output"]["final_report"]
+
+
+def test_analysis_restoration_and_page_shortening_share_a_finite_graph(state, monkeypatch):
+    state["dynamic_worker_results"] = []
+    key = state["evidence_cards"][2]["evidence_id"]
+    state["synthesis_result"]["payload"] = {"comparison_rows": [{
+        "perspective": "market", "evidence_ids": [key], "text": "근거에 따른 조건부 해석",
+    }]}
+    complete = response(state)
+    missing = deepcopy(complete)
+    section = next(s for s in missing["sections"] if s["section_id"] == "section_4_2")
+    section["paragraphs"][0]["claim_type"] = "limitation"
+    _, llm = mock_llm(monkeypatch, complete)
+    llm.with_structured_output.return_value.invoke.side_effect = [missing, missing, complete, complete, complete]
+    monkeypatch.setenv("MAX_ANALYSIS_REWRITES", "2")
+    monkeypatch.setenv("MAX_LENGTH_REWRITES", "2")
+    monkeypatch.setattr(module, "pdf_page_count", Mock(side_effect=[12, 11, 9]))
+    result = module.build_report_graph().invoke({"request": state})
+    assert llm.with_structured_output.return_value.invoke.call_count == 5
+    assert result["analysis_rewrite_count"] == 2
+    assert result["length_rewrite_count"] == 2
+    assert result["page_count"] == 9
+    assert result["output"]["final_report"].startswith("# SUMMARY")
+
+
 def test_outline_citations_and_input_preservation(state, monkeypatch):
-    """목차 순서, 실제 사용 출처만 기재, 미상 날짜, 한계와 입력 보존 확인."""
+    """목차 순서, 사용 출처, 미상 날짜 생략, 한계와 입력 보존 확인."""
     # 중첩된 카드까지 복사하여 실행 후 입력 변경 여부 비교.
     before = deepcopy(state)
     _, llm = mock_llm(monkeypatch, response(state))
@@ -101,13 +226,27 @@ def test_outline_citations_and_input_preservation(state, monkeypatch):
     refs = text.split("# REFERENCE\n")[1]
     assert "technical-cxl_based-001" in refs
     assert "technical-turboquant-001" not in refs
-    assert "발행일 미상" in refs and "p. 1" in refs
+    assert "발행일 미상" not in refs and "p. 1" in refs
     assert "시장 정보 부족" in text
     assert text.index("시장 정보 부족") > text.index("## 6.4")
     assert text.index(module.ANALYTICAL_METHOD_NOTE) > text.index("## 6.4")
     assert state == before
     messages = llm.with_structured_output.return_value.invoke.call_args.args[0]
     assert state["user_query"] in messages[1].content
+
+
+def test_duplicate_valid_inline_ids_render_using_structured_references(
+    state, monkeypatch
+):
+    reply = response(state)
+    paragraph = reply["sections"][0]["paragraphs"][0]
+    key = paragraph["evidence_ids"][0]
+    paragraph["text"] += f" [{key}]"
+    mock_llm(monkeypatch, reply)
+    report = module.report_writer_agent(state)["final_report"]
+    assert report.startswith("# SUMMARY")
+    assert f"[{key}]" not in report
+    assert f"근거 ID: {key}" in report and "[1]" in report
 
 
 def test_report_writer_uses_all_usable_cards(state, monkeypatch):
@@ -131,9 +270,7 @@ def test_redundant_inline_evidence_metadata_is_removed(state, monkeypatch):
     reply = response(state)
     paragraph = reply["sections"][0]["paragraphs"][0]
     paragraph["text"] = (
-        "추론: "
-        + paragraph["text"]
-        + " (evidence_ids: [technical-cxl_based-001])"
+        "추론: " + paragraph["text"] + " (evidence_ids: [technical-cxl_based-001])"
     )
     mock_llm(monkeypatch, reply)
 
@@ -142,6 +279,38 @@ def test_redundant_inline_evidence_metadata_is_removed(state, monkeypatch):
     assert report.startswith("# SUMMARY")
     assert "evidence_ids:" not in report
     assert "추론:" not in report
+
+
+def test_dynamic_report_context_excludes_rejected_worker_claims(state, monkeypatch):
+    accepted = state["usable_evidence_cards"][0]
+    rejected = {
+        **accepted,
+        "evidence_id": "excluded-live-card",
+        "claim": "제외된 미검증 주장",
+    }
+    state["dynamic_worker_results"] = [
+        {
+            "task_id": "runtime-task",
+            "perspective": "technical_maturity",
+            "status": "success",
+            "findings": [rejected["claim"]],
+            "evidence_cards": [accepted, rejected],
+            "limitations": [],
+        }
+    ]
+    state["technical_result"]["summary"] = rejected["claim"]
+    before = deepcopy(state)
+    _, llm = mock_llm(monkeypatch, response(state))
+
+    module.report_writer_agent(state)
+
+    context = json.loads(
+        llm.with_structured_output.return_value.invoke.call_args.args[0][1].content
+    )
+    assert rejected["evidence_id"] not in json.dumps(context, ensure_ascii=False)
+    assert rejected["claim"] not in json.dumps(context, ensure_ascii=False)
+    assert context["worker_results"][0]["evidence_cards"] == [accepted]
+    assert state == before
 
 
 def test_empty_evidence_generates_detailed_analysis(monkeypatch):
@@ -168,16 +337,19 @@ def test_empty_evidence_generates_detailed_analysis(monkeypatch):
     # 결과 확인: 아래 assert 조건 중 하나라도 다르면 테스트 실패.
     assert "추론:" not in output["final_report"]
     assert output["final_report"].count(module.ANALYTICAL_METHOD_NOTE) == 1
-    assert "검증 가능한 근거가 부족하여 이 항목의 판단을 보류한다." not in output[
-        "final_report"
-    ]
+    assert (
+        "검증 가능한 근거가 부족하여 이 항목의 판단을 보류한다."
+        not in output["final_report"]
+    )
     assert (
         re.findall(r"^# (.+)$", output["final_report"], re.MULTILINE) == module.TITLES
     )
     loader.assert_called_once()
-    context = loader.return_value.with_structured_output.return_value.invoke.call_args.args[
-        0
-    ][1].content
+    context = (
+        loader.return_value.with_structured_output.return_value.invoke.call_args.args[
+            0
+        ][1].content
+    )
     assert '"inference_detail_mode": true' in context
     assert "기술 원리에서 출발해 작동 메커니즘을 설명한다." in context
 

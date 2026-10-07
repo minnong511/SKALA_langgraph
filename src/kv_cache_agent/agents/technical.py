@@ -7,8 +7,9 @@ import yaml
 from langchain_core.messages import HumanMessage, SystemMessage
 
 from kv_cache_agent.config import OPENAI_API_KEY
-from kv_cache_agent.graph.state import GlobalState
+from kv_cache_agent.graph.state import LegacyState as GlobalState
 from kv_cache_agent.llm import get_llm
+from kv_cache_agent.schemas.measurement import measurement_fields
 from kv_cache_agent.schemas.outputs import EvidenceCard
 from kv_cache_agent.schemas.technical import TechnicalExtraction
 from kv_cache_agent.tools.paper_retriever import retrieve_paper_chunks
@@ -70,6 +71,7 @@ def _build_context(retrieved_chunks: list[dict[str, Any]]) -> str:
                 [
                     f"[source_chunk_id={chunk['chunk_id']}]",
                     f"source_title={metadata.get('source_title', '')}",
+                    f"source_url={metadata.get('source_url') or metadata.get('source_path', '')}",
                     f"source_locator={metadata.get('source_locator', '')}",
                     f"content={chunk['content']}",
                 ]
@@ -82,18 +84,21 @@ def _extract_findings(
     state: GlobalState,
     retrieved_chunks: list[dict[str, Any]],
 ) -> TechnicalExtraction:
-    """검색된 논문 문맥을 GPT-4o-mini의 구조화 출력으로 변환한다."""
+    """검색된 논문 문맥을 공유 모델의 구조화 출력으로 변환한다."""
     llm = get_llm().with_structured_output(TechnicalExtraction)
     user_query = state.get("user_query", "")
+    source_label = "Task 검색" if state.get("task_instruction") else "논문 검색"
     prompt = (
         f"사용자 질문: {user_query}\n\n"
-        "아래 논문 검색 결과만 사용하여 기술 조사 결과를 작성하라.\n"
+        f"아래 {source_label} 결과만 사용하여 배정된 조사 결과를 작성하라.\n"
         "각 finding에는 실제 검색 결과의 source_chunk_id를 반드시 넣어라.\n\n"
-        f"논문 검색 결과:\n{_build_context(retrieved_chunks)}"
+        f"{source_label} 결과:\n{_build_context(retrieved_chunks)}"
     )
     response = llm.invoke(
         [
-            SystemMessage(content=_load_system_prompt()),
+            SystemMessage(
+                content=state.get("task_instruction") or _load_system_prompt()
+            ),
             HumanMessage(content=prompt),
         ]
     )
@@ -150,14 +155,16 @@ def _build_evidence_cards(
                     first_metadata.get("source_url")
                     or first_metadata.get("source_path", "")
                 ),
-                "source_type": "paper",
+                "source_type": first_metadata.get("source_type", "paper"),
                 "source_locator": "; ".join(source_locators),
-                "retrieval_method": "faiss",
+                "retrieval_method": first_metadata.get("retrieval_method", "faiss"),
                 "published_date": str(first_metadata.get("published_date", "")),
                 "claim_type": finding.claim_type,
                 "confidence": finding.confidence,
                 "caveat": finding.caveat,
                 "verification_status": "unverified",
+                "source_chunk_ids": [chunk["chunk_id"] for chunk in source_chunks],
+                **measurement_fields(finding),
             }
         )
 

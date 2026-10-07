@@ -1,5 +1,8 @@
 # KV Cache SW vs HW 개발 순서
 
+> 이 문서는 기존 Supervisor Fixed Flow의 개발 계획 기록이다. 현재 실행 구조,
+> State, 품질 Loop와 사용 방법은 [README.md](README.md)의 Orchestrator-Workers 설명을 따른다.
+
 ## 1. 프로젝트 목표
 
 TurboQuant와 CXL-based KV Cache 기술을 대상으로 기술성, 시장성, 이해관계자 반응, 클라우드 도메인 적합성을 평가하는 Supervisor 기반 Agentic RAG를 구현한다.

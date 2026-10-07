@@ -15,6 +15,9 @@ outputs/reports/*
 !outputs/reports/.gitkeep
 outputs/logs/*
 !outputs/logs/.gitkeep
+outputs/checkpoints/
+outputs/validation/
+.playwright-cli/
 
 .DS_Store
 
