@@ -782,3 +782,12 @@ def stakeholder_evaluation_agent(state: GlobalState) -> dict[str, Any]:
         "stakeholder_result": result["stakeholder_result"],
         "evidence_cards": result.get("evidence_cards", []),
     }
+
+
+def run_stakeholder_task(request, *, budget=None, config=None, worker=None):
+    """Run a new WorkerInput assignment; legacy workflow adapter stays available."""
+    from kv_cache_agent.agents.task_worker import run_task
+
+    return run_task(
+        "stakeholder", request, budget=budget, config=config, worker=worker
+    )

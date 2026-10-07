@@ -1,6 +1,8 @@
 from pathlib import Path
 from unittest.mock import Mock
 
+import pytest
+
 from kv_cache_agent.schemas.evidence import EvidenceCard, SourceRef, SourceSnapshot
 from kv_cache_agent.schemas.report import DraftClaim
 from kv_cache_agent.verification.pipeline import (
@@ -56,6 +58,7 @@ def supporting_judge(claims, _evidence, _sources):
                 matched_text="Memory usage is reduced.",
                 rationale="Original text directly supports this claim.",
                 claim_type_assessment="correct",
+                criterion_assessment="relevant",
             )
             for c in claims
         ]
@@ -139,6 +142,7 @@ def test_quote_and_judge_id_checks_prevent_false_promotion():
                     matched_text="Invented quote",
                     rationale="claimed match",
                     claim_type_assessment="correct",
+                    criterion_assessment="relevant",
                 )
             ]
         )
@@ -309,3 +313,32 @@ def test_implicit_truncation_is_partial_and_invalidates_prior_receipt():
         loader=lambda _: clipped, judge=supporting_judge
     ).verify([claim], [evidence])
     assert result.decisions[0].status == "partially_verified"
+
+
+@pytest.mark.parametrize("assessment", ("irrelevant", "unclear"))
+def test_true_source_fact_cannot_fill_an_unanswered_criterion(assessment):
+    _ref, evidence, claim = inputs()
+    claim = claim.model_copy(update={"criterion": "adoption"})
+    evidence = evidence.model_copy(update={"criterion": "adoption"})
+
+    def judge(claims, cards, sources):
+        return JudgementBatch(
+            decisions=[
+                ClaimJudgement(
+                    claim_id=c.claim_id,
+                    support_level="full",
+                    matched_text="Memory usage is reduced.",
+                    rationale="Memory reduction does not demonstrate actual adoption.",
+                    claim_type_assessment="correct",
+                    criterion_assessment=assessment,
+                )
+                for c in claims
+            ]
+        )
+
+    result = VerificationPipeline(loader=loader, judge=judge).verify(
+        [claim], [evidence]
+    )
+    assert result.decisions[0].status != "verified"
+    assert result.coverage[0].status == "unsupported"
+    assert result.revision_requests

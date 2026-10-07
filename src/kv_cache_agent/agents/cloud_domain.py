@@ -407,11 +407,15 @@ def _build_evidence_cards(
     vector_chunks: list[dict[str, Any]],
 ) -> tuple[list[EvidenceCard], list[str]]:
     """구조화 결과를 공통 EvidenceCard 형식으로 변환한다."""
-    technical_by_url = {
-        str(card.get("source_url", "")).strip(): card
-        for card in technical_cards
-        if str(card.get("source_url", "")).strip()
-    }
+    technical_by_url = {}
+    technical_by_url_and_locator = {}
+    for card in technical_cards:
+        url = str(card.get("source_url", "")).strip()
+        if url:
+            technical_by_url.setdefault(url, card)
+            technical_by_url_and_locator[(
+                url, str(card.get("source_locator", "")).strip()
+            )] = card
     web_by_url = {
         str(result.get("url", "")).strip(): result
         for result in web_results
@@ -452,17 +456,29 @@ def _build_evidence_cards(
         seen_findings.add(finding_key)
 
         if source_url in technical_by_url:
-            source = technical_by_url[source_url]
+            source = technical_by_url_and_locator.get((source_url, requested_locator))
+            if source is None and requested_locator:
+                # An explicit locator cannot fall back to another page of this URL.
+                vector_source = vector_by_url_and_locator.get((source_url, requested_locator))
+                if vector_source is None:
+                    skipped_findings.append(finding.claim)
+                    continue
+                source = {
+                    **vector_source.get("metadata", {}),
+                    "source_type": "paper", "retrieval_method": "faiss",
+                }
+            source = source or technical_by_url[source_url]
             source_title = str(source.get("source_title", ""))
             source_type = source.get("source_type", "paper")
             source_locator = str(source.get("source_locator", ""))
             retrieval_method = source.get("retrieval_method", "faiss")
             published_date = str(source.get("published_date", ""))
         elif source_url in vector_by_url:
-            vector_source = vector_by_url_and_locator.get(
-                (source_url, requested_locator),
-                vector_by_url[source_url],
-            )
+            vector_source = vector_by_url_and_locator.get((source_url, requested_locator))
+            if vector_source is None and requested_locator:
+                skipped_findings.append(finding.claim)
+                continue
+            vector_source = vector_source or vector_by_url[source_url]
             metadata = vector_source.get("metadata", {})
             source_title = str(metadata.get("source_title", ""))
             source_type = "paper"
@@ -966,3 +982,12 @@ def cloud_domain_agent(state: GlobalState) -> dict[str, Any]:
         "cloud_domain_result": graph_result["cloud_domain_result"],
         "evidence_cards": graph_result.get("evidence_cards", []),
     }
+
+
+def run_cloud_domain_task(request, *, budget=None, config=None, worker=None):
+    """Run a new WorkerInput assignment; legacy workflow adapter stays available."""
+    from kv_cache_agent.agents.task_worker import run_task
+
+    return run_task(
+        "cloud_domain", request, budget=budget, config=config, worker=worker
+    )

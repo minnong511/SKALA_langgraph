@@ -118,11 +118,13 @@ class TavilyExtractor:
         return self.client
 
     @traced_tool("tavily.extract")
-    def extract(self, urls: list[str]) -> ExtractBatch:
+    def extract(
+        self, urls: list[str], *, budget: BudgetLedger | None = None
+    ) -> ExtractBatch:
         with self._lock:
-            return self._extract(urls)
+            return self._extract(urls, budget=budget or self.budget)
 
-    def _extract(self, urls: list[str]) -> ExtractBatch:
+    def _extract(self, urls: list[str], *, budget=None) -> ExtractBatch:
         requested = list(dict.fromkeys(canonical_url(url) for url in urls))
         now = self.clock()
         results: dict[str, SourceSnapshot] = {}
@@ -142,8 +144,8 @@ class TavilyExtractor:
         credits: float | None = None
         for start in range(0, len(pending), self.batch_size):
             batch = pending[start : start + self.batch_size]
-            if self.budget:
-                self.budget.reserve(extract_calls=1, extract_urls=len(batch))
+            if budget:
+                budget.reserve(extract_calls=1, extract_urls=len(batch))
             emit(
                 "tool_start",
                 message="Tavily 본문 추출",

@@ -343,6 +343,7 @@ def test_cloud_domain_prompt_uses_required_yaml_format() -> None:
         "role",
         "goals",
         "system_prompt",
+        "worker_system_prompt",
         "input_fields",
         "output_fields",
         "constraints",

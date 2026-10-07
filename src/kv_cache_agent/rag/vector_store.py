@@ -1,12 +1,24 @@
 """FAISS 인덱스 생성, 저장, 로드, 검색을 담당하는 모듈."""
 
+from collections import OrderedDict
 from pathlib import Path
+from threading import RLock
 
 from langchain_community.vectorstores import FAISS
 from langchain_core.documents import Document
 from langchain_core.embeddings import Embeddings
 
 from kv_cache_agent.rag.embeddings import get_embeddings
+
+_LOCK = RLock()
+_STORES: OrderedDict[tuple, FAISS] = OrderedDict()
+
+
+def clear_vector_store_cache(path: Path | None = None) -> None:
+    with _LOCK:
+        for key in list(_STORES):
+            if path is None or key[0] == str(path.resolve()):
+                _STORES.pop(key)
 
 
 def build_vector_store(
@@ -21,7 +33,9 @@ def build_vector_store(
 def save_vector_store(vector_store: FAISS, path: Path) -> None:
     """FAISS 인덱스를 지정한 로컬 디렉터리에 저장한다."""
     path.mkdir(parents=True, exist_ok=True)
-    vector_store.save_local(str(path))
+    with _LOCK:
+        vector_store.save_local(str(path))
+        clear_vector_store_cache(path)
 
 
 def load_vector_store(
@@ -31,17 +45,27 @@ def load_vector_store(
     """프로젝트가 직접 생성한 로컬 FAISS 인덱스를 로드한다."""
     if not (path / "index.faiss").exists() or not (path / "index.pkl").exists():
         raise FileNotFoundError(
-            f"FAISS 인덱스를 찾을 수 없습니다: {path}. "
-            "먼저 ingest_papers를 실행하세요."
+            f"FAISS 인덱스를 찾을 수 없습니다: {path}. 먼저 ingest_papers를 실행하세요."
         )
 
     embedder = embeddings or get_embeddings()
-    return FAISS.load_local(
-        str(path),
-        embedder,
-        # 외부에서 받은 파일은 로드하지 않고 프로젝트가 만든 인덱스만 사용한다.
-        allow_dangerous_deserialization=True,
-    )
+    with _LOCK:
+        stamps = tuple(
+            (file.stat().st_mtime_ns, file.stat().st_ctime_ns, file.stat().st_size)
+            for file in (path / "index.faiss", path / "index.pkl")
+        )
+        key = (str(path.resolve()), stamps, id(embedder))
+        if key not in _STORES:
+            _STORES[key] = FAISS.load_local(
+                str(path),
+                embedder,
+                # Only load locally generated project indexes.
+                allow_dangerous_deserialization=True,
+            )
+        _STORES.move_to_end(key)
+        while len(_STORES) > 4:
+            _STORES.popitem(last=False)
+        return _STORES[key]
 
 
 def search_vector_store(

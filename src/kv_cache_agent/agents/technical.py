@@ -259,3 +259,12 @@ def technical_research_agent(state: GlobalState) -> dict[str, Any]:
         },
         "evidence_cards": evidence_cards,
     }
+
+
+def run_technical_task(request, *, budget=None, config=None, worker=None):
+    """Run a new WorkerInput assignment; legacy workflow adapter stays available."""
+    from kv_cache_agent.agents.task_worker import run_task
+
+    return run_task(
+        "technical", request, budget=budget, config=config, worker=worker
+    )

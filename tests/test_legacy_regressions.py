@@ -29,9 +29,6 @@ def test_legacy_pdf_cache_uses_each_cards_locator():
     )
 
 
-@pytest.mark.xfail(
-    strict=True, reason="Stage 8: cloud worker locator ownership migration"
-)
 def test_cloud_worker_preserves_requested_page():
     from kv_cache_agent.agents import cloud_domain as module
 

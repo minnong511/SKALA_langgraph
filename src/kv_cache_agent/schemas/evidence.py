@@ -86,6 +86,13 @@ class SourceSnapshot(Contract):
         )
 
 
+class ClaimAttribution(Contract):
+    actor: str = Field(min_length=1)
+    actor_group: str = Field(min_length=1)
+    statement_kind: Literal["public_statement", "documented_fact", "analyst_inference"]
+    position: Literal["positive", "negative", "mixed", "neutral", "uncertain"]
+
+
 class EvidenceCard(Contract):
     evidence_id: str = Field(min_length=1)
     version: int = Field(default=1, ge=1)
@@ -98,6 +105,7 @@ class EvidenceCard(Contract):
     claim_type: Literal["fact", "inference"]
     confidence: float | None = Field(default=None, ge=0, le=1)
     caveat: str = ""
+    attribution: ClaimAttribution | None = None
 
 
 class VerificationDecision(Contract):
@@ -111,6 +119,7 @@ class VerificationDecision(Contract):
     rationale: str
     matched_text: str = ""
     claim_type_assessment: Literal["correct", "should_be_inference", "unclear"]
+    criterion_assessment: Literal["relevant", "irrelevant", "unclear"] = "unclear"
     issues: tuple[str, ...] = ()
 
     def applies_to(self, claim, snapshots: dict[str, SourceSnapshot]) -> bool:

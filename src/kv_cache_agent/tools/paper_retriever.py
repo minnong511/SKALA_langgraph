@@ -6,9 +6,12 @@ from typing import Any
 from langchain_community.vectorstores import FAISS
 
 from kv_cache_agent.config import VECTOR_DB_DIR
+from kv_cache_agent.observability.logger import emit
+from kv_cache_agent.observability.tracing import traced_tool
 from kv_cache_agent.rag.vector_store import load_vector_store, search_vector_store
 
 
+@traced_tool("paper.retrieve")
 def retrieve_paper_chunks(
     queries: list[str],
     top_k: int = 5,
@@ -48,4 +51,7 @@ def retrieve_paper_chunks(
                 }
             )
 
+    emit("paper_retrieval_completed", details={
+        "query_count": len(queries), "chunk_count": len(retrieved),
+    })
     return retrieved

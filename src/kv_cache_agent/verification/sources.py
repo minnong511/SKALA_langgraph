@@ -12,6 +12,7 @@ from kv_cache_agent.observability.logger import emit
 from kv_cache_agent.observability.tracing import traced_tool
 from kv_cache_agent.schemas.base import fingerprint, stable_id
 from kv_cache_agent.schemas.evidence import SourceRef, SourceSnapshot
+from kv_cache_agent.schemas.research import BudgetLedger
 from kv_cache_agent.tools.tavily_extract import TavilyExtractor, get_extractor
 
 
@@ -96,10 +97,15 @@ def classify_source(location: str) -> str:
 
 class SourceLoader:
     def __init__(
-        self, *, root: Path = ROOT_DIR, extractor: TavilyExtractor | None = None
+        self,
+        *,
+        root: Path = ROOT_DIR,
+        extractor: TavilyExtractor | None = None,
+        budget: BudgetLedger | None = None,
     ):
         self.root = Path(root).resolve()
         self.extractor = extractor
+        self.budget = budget
         self._local_cache: dict[tuple[str, str, tuple[int, ...]], SourceSnapshot] = {}
         self._lock = RLock()
 
@@ -109,14 +115,21 @@ class SourceLoader:
         if parsed.scheme:
             snapshot = (
                 (self.extractor or get_extractor())
-                .extract([reference.location])
+                .extract(
+                    [reference.location],
+                    **({"budget": self.budget} if self.budget is not None else {}),
+                )
                 .snapshots[0]
             )
+            if (
+                snapshot.status == "ok"
+                and reference.version
+                and (reference.version != snapshot.content_hash)
+            ):
+                raise ValueError(
+                    "Source changed since its document version was recorded"
+                )
             if reference.character_range is not None and snapshot.status == "ok":
-                if reference.version != snapshot.content_hash:
-                    raise ValueError(
-                        "Source changed since the character span was selected"
-                    )
                 start, end = reference.character_range
                 if end > len(snapshot.content):
                     raise ValueError("Character span exceeds the source body")
@@ -128,7 +141,17 @@ class SourceLoader:
                     retrieved_at=snapshot.retrieved_at,
                     provider_request_id=snapshot.provider_request_id,
                 )
-            return snapshot.model_copy(update={"reference": reference})
+            return snapshot.model_copy(
+                update={
+                    "reference": reference.model_copy(
+                        update={
+                            "version": snapshot.content_hash
+                            if snapshot.status == "ok"
+                            else reference.version
+                        }
+                    )
+                }
+            )
         path = Path(reference.location)
         path = (path if path.is_absolute() else self.root / path).resolve()
         if not path.is_relative_to(self.root):
@@ -145,23 +168,35 @@ class SourceLoader:
                     "source_cache_hit",
                     details={"source_id": reference.source_id, "pages": pages},
                 )
-                return self._local_cache[key].model_copy(
-                    update={"reference": actual_reference}
+                snapshot = self._local_cache[key]
+            else:
+                content = read_pdf_pages(path, pages=pages)
+                snapshot = SourceSnapshot(
+                    reference=actual_reference,
+                    acquisition="local_pdf",
+                    content=content,
+                    status="ok" if content else "empty",
                 )
-            content = read_pdf_pages(path, pages=pages)
-            snapshot = SourceSnapshot(
-                reference=actual_reference,
-                acquisition="local_pdf",
-                content=content,
-                status="ok" if content else "empty",
-            )
-            self._local_cache[key] = snapshot
+                self._local_cache[key] = snapshot
+            if reference.character_range is not None and snapshot.status == "ok":
+                start, end = reference.character_range
+                if end > len(snapshot.content):
+                    raise ValueError("Character span exceeds the PDF page body")
+                snapshot = SourceSnapshot(
+                    reference=actual_reference,
+                    acquisition="local_pdf",
+                    status="ok",
+                    content=snapshot.content[start:end],
+                    retrieved_at=snapshot.retrieved_at,
+                )
+            else:
+                snapshot = snapshot.model_copy(update={"reference": actual_reference})
             emit(
                 "source_loaded",
                 details={
                     "source_id": reference.source_id,
                     "pages": pages,
-                    "characters": len(content),
+                    "characters": len(snapshot.content),
                     "version": digest,
                 },
             )

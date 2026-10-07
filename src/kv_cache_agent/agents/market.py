@@ -747,3 +747,12 @@ def market_evaluation_agent(state: GlobalState) -> dict[str, Any]:
         "market_result": graph_result["market_result"],
         "evidence_cards": graph_result.get("evidence_cards", []),
     }
+
+
+def run_market_task(request, *, budget=None, config=None, worker=None):
+    """Run a new WorkerInput assignment; legacy workflow adapter stays available."""
+    from kv_cache_agent.agents.task_worker import run_task
+
+    return run_task(
+        "market", request, budget=budget, config=config, worker=worker
+    )

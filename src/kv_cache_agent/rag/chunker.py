@@ -6,6 +6,8 @@ from langchain_core.documents import Document
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from pypdf import PdfReader
 
+from kv_cache_agent.schemas.base import fingerprint
+
 # BGE-M3에 넣기 적당한 크기가 되도록 문자 기준으로 분할한다.
 DEFAULT_CHUNK_SIZE = 3_500
 DEFAULT_CHUNK_OVERLAP = 500
@@ -18,6 +20,7 @@ def load_pdf_documents(pdf_path: Path) -> list[Document]:
     metadata_title = pdf_metadata.title if pdf_metadata else None
     pdf_title = str(metadata_title or pdf_path.stem)
     documents: list[Document] = []
+    document_version = fingerprint(pdf_path.read_bytes().hex())
 
     for page_number, page in enumerate(reader.pages, start=1):
         page_text = (page.extract_text() or "").strip()
@@ -32,6 +35,7 @@ def load_pdf_documents(pdf_path: Path) -> list[Document]:
                     "source_title": pdf_title,
                     "source_path": str(pdf_path),
                     "source_type": "paper",
+                    "source_version": document_version,
                     "page": page_number,
                 },
             )
